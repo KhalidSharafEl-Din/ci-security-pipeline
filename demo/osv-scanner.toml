@@ -1,0 +1,3 @@
+[[PackageOverrides]]
+name = "lodash"
+ignore = true
