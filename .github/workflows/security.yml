@@ -159,13 +159,13 @@ jobs:
           BASELINE: ${{ steps.scope.outputs.baseline }}
         run: |
           set -euo pipefail
-          # Semgrep honours its suppression marker in any case, anywhere after a
-          # space, in comments or not. Each one must name the rule and give a
-          # reason, like this:
+          # Semgrep treats any word that starts with "nosem" after a space as a
+          # suppression marker, in any case, in comments or not. Each one must
+          # name the rule and give a reason, like this:
           #   // nosemgrep: rule-id -- why this is safe
           # The third branch matches a marker at the start of a line, after the
-          # "file:line:" prefix. The brackets stop this check matching itself.
-          marker='(^|[[:space:]]|^[^:]*:[0-9]+:)nosem([g]rep)?\b'
+          # "file:line:" prefix. The bracket stops this check matching itself.
+          marker='(^|[[:space:]]|^[^:]*:[0-9]+:)nose[m]'
           valid='nosem([g]rep)?[:=] *[A-Za-z0-9_.-]+( *, *[A-Za-z0-9_.-]+)* +-- +[^ ]'
           if [ "$MODE" = "diff" ]; then
             # Pull requests only answer for the lines they add.
@@ -528,15 +528,25 @@ jobs:
           args+=("--log-opts=--remerge-diff ${range}")
           "$RUNNER_TEMP/bin/gitleaks" "${args[@]}" .
           # --remerge-diff can't show what an octopus merge (three or more
-          # parents) added, so a secret could hide there. Block those merges
-          # instead of reporting a clean result.
-          octopus=$(git rev-list --min-parents=3 "$range" | wc -l)
-          if [ "$octopus" -gt 0 ]; then
-            git rev-list --min-parents=3 "$range" | while read -r sha; do
+          # parents) added, so a secret could hide there. A pull request that
+          # adds one is blocked. Full scans only warn, because an old octopus
+          # merge in history can't be undone.
+          octopus=0
+          while read -r sha; do
+            [ -n "$sha" ] || continue
+            if [ "$MODE" = "diff" ]; then
+              octopus=$((octopus + 1))
               echo "::error title=Gitleaks can't scan this merge::Commit $sha merges three or more parents. Gitleaks can't see what it added, so the gate blocks it. Merge one branch at a time."
-            done
-          fi
+            else
+              echo "::warning title=Gitleaks can't scan this merge::Commit $sha merges three or more parents. Gitleaks couldn't check what it added. Review it by hand once."
+            fi
+          done <<< "$(git rev-list --min-parents=3 "$range")"
           echo "octopus=$octopus" >> "$GITHUB_OUTPUT"
+          # Code scanning needs paths that exist. Findings from a merge
+          # resolution carry a "b/" prefix from the remerge diff, so the upload
+          # copy strips it. The report keeps it, because the fingerprint uses it.
+          jq '(.runs[].results[]?.locations[]?.physicalLocation.artifactLocation.uri) |= sub("^b/"; "")' \
+            "$out/gitleaks.sarif" > "$RUNNER_TEMP/gitleaks-upload.sarif"
 
       - name: Check suppressions have a reason
         id: suppressions
@@ -617,7 +627,7 @@ jobs:
         if: always() && steps.scan.outcome == 'success' && inputs.upload-sarif && steps.scope.outputs.mode == 'full'
         uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
-          sarif_file: ${{ runner.temp }}/gitleaks/gitleaks.sarif
+          sarif_file: ${{ runner.temp }}/gitleaks-upload.sarif
           category: gitleaks${{ inputs.name != '' && format('-{0}', inputs.name) || '' }}
 
       - name: Keep the reports

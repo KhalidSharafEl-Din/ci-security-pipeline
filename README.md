@@ -107,7 +107,7 @@ Some results that aren't findings also block, because each one means a clean res
 
 - A `nosemgrep` comment, `.gitleaksignore` block or `osv-scanner.toml` entry without a written reason. On pull requests, only the lines and ignore files the pull request changes are checked.
 - A Semgrep timeout or crash, which leaves part of the code unanalysed. Parse errors in single files are reported but don't block. An incomplete scan also skips the code scanning upload, so existing alerts don't show as fixed.
-- A merge commit with three or more parents (an octopus merge). Gitleaks can't see what such a merge added, so the gate blocks it.
+- A pull request that adds a merge commit with three or more parents (an octopus merge). Gitleaks can't see what such a merge added. Full scans only warn about octopus merges already in history.
 - A pull request that removes every lockfile OSV-Scanner found on the target branch.
 - A scanner job that failed, timed out or was cancelled. The gate never reads a missing result as "no findings".
 
@@ -125,7 +125,7 @@ Each tool keeps its own suppression format. The workflow requires a reason on ea
 exec(cmd, cb); // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process -- cmd is a constant
 ```
 
-Semgrep honors the marker in any letter case, wherever it follows a space, so the check does too. A bare `nosemgrep`, `NOSEMGREP` or `// TODO nosem`, or any marker without both a rule ID and a reason, fails the gate. To skip whole paths, such as generated code or test fixtures, add a `.semgrepignore` file and explain each path in a comment.
+Semgrep treats any word that starts with `nosem` after a space as a marker, in any letter case, so the check does too. A bare `nosemgrep`, `NOSEMGREP` or `// TODO nosem`, or any marker without both a rule ID and a reason, fails the gate. To skip whole paths, such as generated code or test fixtures, add a `.semgrepignore` file and explain each path in a comment.
 
 **OSV-Scanner.** Add an entry to `osv-scanner.toml` next to the lockfile. Both `reason` and `ignoreUntil` are required, so the decision comes back for review when it expires. A `[[PackageOverrides]]` entry, which can hide every advisory for a package, needs a `reason` and an `effectiveUntil` date:
 
@@ -139,7 +139,8 @@ reason = "Only called with constant templates and no options. Upgrade needs the 
 **Gitleaks.** Copy the fingerprint from the Gitleaks job summary into `.gitleaksignore`, under a comment that says why. One comment covers the block of lines below it, up to the next blank line. The summary prints two forms:
 
 - For a real secret, rotate it first, then use the form with the commit SHA. It covers that one commit, so the same value committed again still fails.
-- For a false positive that stays in the code, use the form without the commit. It keeps working after a squash or rebase merge changes the commit SHA.
+- For a false positive that stays in the code, use the form without the commit. It keeps working after a squash or rebase merge changes the commit SHA. It also silences any future match of that rule on that line, so keep these entries few.
+- On repositories that rebase-merge, a rotated secret that stays in history gets a new commit SHA on `main`. Add a second entry from the full scan on `main` after the merge.
 
 ```
 # Rotated on 2026-11-08, the key in this commit no longer works.
@@ -193,6 +194,7 @@ Pull requests only see new findings, so they work from day one. Runs on `push` a
 3. For dependencies, upgrade what's cheap. Add an `osv-scanner.toml` entry with a reason and an `ignoreUntil` date for the rest.
 4. For code, fix the blocking Semgrep findings or suppress them with a reason. Use `severity-threshold: critical` for a while if the list is long, and lower it once the backlog is gone.
 5. If Semgrep times out on large generated or minified files, add them to `.semgrepignore` with a comment. A timeout blocks the gate, because those files were never analysed.
+6. Migrate existing suppressions. The first run lists every `nosemgrep` comment without a rule ID and reason, `.gitleaksignore` entry without a comment, and `osv-scanner.toml` entry without an expiry. Inline `gitleaks:allow` comments stop working, so move those to `.gitleaksignore`.
 
 ## Repository layout
 
