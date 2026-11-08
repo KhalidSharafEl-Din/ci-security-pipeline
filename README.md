@@ -44,7 +44,7 @@ permissions: {}
 
 jobs:
   security:
-    uses: KhalidSharafEl-Din/ci-security-pipeline/.github/workflows/security.yml@de0ad3980b079dc66cd341664b0e0186d1f9a7f4 # v1.0.0
+    uses: KhalidSharafEl-Din/ci-security-pipeline/.github/workflows/security.yml@f65bffef4d43401a40aae25c2b6f95207c7bcbbb # v1.0.0
     permissions:
       contents: read # check out the code
       security-events: write # upload SARIF to code scanning
