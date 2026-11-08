@@ -159,11 +159,14 @@ jobs:
           BASELINE: ${{ steps.scope.outputs.baseline }}
         run: |
           set -euo pipefail
-          # A nosemgrep (or nosem) comment must name the rule and give a reason:
+          # Semgrep honours its suppression marker in any case, anywhere after a
+          # space, in comments or not. Each one must name the rule and give a
+          # reason, like this:
           #   // nosemgrep: rule-id -- why this is safe
-          # Only comments count, and the brackets stop this check matching itself.
-          marker='(//|#|/\*|<!--|;|--) *nosem([g]rep)?\b'
-          valid='nosem[g]rep: *[A-Za-z0-9_.-]+( *, *[A-Za-z0-9_.-]+)* +-- +[^ ]'
+          # The third branch matches a marker at the start of a line, after the
+          # "file:line:" prefix. The brackets stop this check matching itself.
+          marker='(^|[[:space:]]|^[^:]*:[0-9]+:)nosem([g]rep)?\b'
+          valid='nosem([g]rep)?[:=] *[A-Za-z0-9_.-]+( *, *[A-Za-z0-9_.-]+)* +-- +[^ ]'
           if [ "$MODE" = "diff" ]; then
             # Pull requests only answer for the lines they add.
             lines=$(git diff -U0 --no-color "$BASELINE" HEAD -- . ':!*.md' | awk '
@@ -172,9 +175,9 @@ jobs:
               /^@@ / { split($3, range, ","); line = substr(range[1], 2) + 0; next }
               !header && /^\+/ { print file ":" line ":" substr($0, 2); line++ }')
           else
-            lines=$(git grep -nE "$marker" -- ':!*.md' || true)
+            lines=$(git grep -niE "$marker" -- ':!*.md' || true)
           fi
-          bad=$(printf '%s\n' "$lines" | grep -E "$marker" | grep -vE "$valid" || true)
+          bad=$(printf '%s\n' "$lines" | grep -iE "$marker" | grep -viE "$valid" || true)
           count=0
           if [ -n "$bad" ]; then
             count=$(printf '%s\n' "$bad" | wc -l)
@@ -592,10 +595,10 @@ jobs:
               echo
               echo "Rotate each secret, then add its fingerprint to \`.gitleaksignore\` under a reason comment."
               echo
-              echo "| Rule | Location | Fingerprint |"
-              echo "| --- | --- | --- |"
+              echo "| Rule | Location | Fingerprint (rotated secret) | Fingerprint (false positive) |"
+              echo "| --- | --- | --- | --- |"
               jq -r '.runs[].results[] | .locations[0].physicalLocation as $loc |
-                "| `\(.ruleId)` | `\($loc.artifactLocation.uri):\($loc.region.startLine)` | `\(.partialFingerprints.commitSha):\($loc.artifactLocation.uri):\(.ruleId):\($loc.region.startLine)` |"' "$sarif"
+                "| `\(.ruleId)` | `\($loc.artifactLocation.uri):\($loc.region.startLine)` | `\(.partialFingerprints.commitSha):\($loc.artifactLocation.uri):\(.ruleId):\($loc.region.startLine)` | `\($loc.artifactLocation.uri):\(.ruleId):\($loc.region.startLine)` |"' "$sarif"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           # Findings from a merge resolution carry a "b/" path prefix from the
