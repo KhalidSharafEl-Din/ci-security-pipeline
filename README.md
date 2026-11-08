@@ -43,14 +43,14 @@ permissions: {}
 
 jobs:
   security:
-    uses: KhalidSharafEl-Din/ci-security-pipeline/.github/workflows/security.yml@<commit-sha> # v1.0.0
+    uses: KhalidSharafEl-Din/ci-security-pipeline/.github/workflows/security.yml@b2102170290f85c6279badf77cf21877e12838e1 # v1.0.0
     permissions:
       contents: read # check out the code
       security-events: write # upload SARIF to code scanning
       actions: read # code scanning reads the run metadata on private repos
 ```
 
-Replace `<commit-sha>` with the full SHA of the [latest release](https://github.com/KhalidSharafEl-Din/ci-security-pipeline/releases). Pin to the SHA, not the tag, because a tag can be moved to different code. Dependabot's `github-actions` updates understand this format and keep the SHA and the comment current.
+The SHA above is the [v1.0.0 release](https://github.com/KhalidSharafEl-Din/ci-security-pipeline/releases/tag/v1.0.0). Use the SHA of the latest release. Pin to the SHA, not the tag, because a tag can be moved to different code. Dependabot's `github-actions` updates understand this format and keep the SHA and the comment current.
 
 Then make the `security / gate` check required, under Settings, Rules, Rulesets, "Require status checks to pass". The scanner jobs don't fail on findings, so the gate is the only check you need to require.
 
