@@ -195,15 +195,20 @@ jobs:
           fi
           # A marker can only suppress something in a file Semgrep scanned, so
           # tracked files it skipped (.semgrepignore, unsupported types) don't
-          # count. A line is dropped only when it clearly belongs to one of
-          # those files. Anything that doesn't match cleanly stays flagged.
-          # FILENAME, not NR == FNR, because the skipped list is often empty.
+          # count. A line is kept when it starts with a scanned file's name and
+          # dropped only when it starts with a skipped one. That order matters
+          # for names that contain a colon, such as "LICENSE:x.py". Anything
+          # that matches neither stays flagged. FILENAME, not NR == FNR,
+          # because either list can be empty.
           jq -r '.paths.scanned[]?' "$RUNNER_TEMP/semgrep/semgrep.json" | sort -u > "$RUNNER_TEMP/semgrep-scanned.txt"
-          git -c core.quotePath=false ls-files | sort -u |
+          git ls-files -z | tr '\0' '\n' | sort -u |
             comm -23 - "$RUNNER_TEMP/semgrep-scanned.txt" > "$RUNNER_TEMP/semgrep-skipped.txt"
           bad=$(printf '%s\n' "$lines" | grep -iE "$marker" | grep -viE "$valid" |
-            awk 'FILENAME == ARGV[1] { skipped[++n] = $0 ":"; next }
-                 { for (i = 1; i <= n; i++) if (index($0, skipped[i]) == 1) next; print }' "$RUNNER_TEMP/semgrep-skipped.txt" - || true)
+            awk 'FILENAME == ARGV[1] { scanned[++s] = $0 ":"; next }
+                 FILENAME == ARGV[2] { skipped[++k] = $0 ":"; next }
+                 { for (i = 1; i <= s; i++) if (index($0, scanned[i]) == 1) { print; next }
+                   for (i = 1; i <= k; i++) if (index($0, skipped[i]) == 1) next
+                   print }' "$RUNNER_TEMP/semgrep-scanned.txt" "$RUNNER_TEMP/semgrep-skipped.txt" - || true)
           count=0
           if [ -n "$bad" ]; then
             count=$(printf '%s\n' "$bad" | wc -l)
