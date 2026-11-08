@@ -159,14 +159,15 @@ jobs:
           BASELINE: ${{ steps.scope.outputs.baseline }}
         run: |
           set -euo pipefail
-          # Semgrep treats any word that starts with "nosem" after a space as a
-          # suppression marker, in any case, in comments or not. Each one must
-          # name the rule and give a reason, like this:
+          # Semgrep accepts its suppression marker in many spellings: any case,
+          # with or without a comment marker or a space before it, on the line
+          # or the line above. Rather than copy those rules, this check treats
+          # any text that starts like the marker as one. Each must name the rule and give
+          # a reason, like this:
           #   // nosemgrep: rule-id -- why this is safe
-          # The third branch matches a marker at the start of a line, after the
-          # "file:line:" prefix. The bracket stops this check matching itself.
-          marker='(^|[[:space:]]|^[^:]*:[0-9]+:)nose[m]'
-          valid='nosem([g]rep)?[:=] *[A-Za-z0-9_.-]+( *, *[A-Za-z0-9_.-]+)* +-- +[^ ]'
+          # The bracket stops this check matching itself.
+          marker='nose[m]'
+          valid='nose[m]([g]rep)?[:=] *[A-Za-z0-9_.-]+( *, *[A-Za-z0-9_.-]+)* +-- +[^ ]'
           if [ "$MODE" = "diff" ]; then
             # Pull requests only answer for the lines they add.
             lines=$(git diff -U0 --no-color "$BASELINE" HEAD -- . ':!*.md' | awk '
@@ -531,14 +532,25 @@ jobs:
           # parents) added, so a secret could hide there. A pull request that
           # adds one is blocked. Full scans only warn, because an old octopus
           # merge in history can't be undone.
+          # A pull request that adds one is blocked. In a full scan, an old
+          # octopus merge blocks until someone has checked it by hand and
+          # recorded that in .gitleaksignore with a reason:
+          #   # reviewed-merge <full commit SHA> <reason>
+          reviewed=""
+          if [ -f .gitleaksignore ]; then
+            reviewed=$(sed -nE 's/^[[:space:]]*#[[:space:]]*reviewed-merge[[:space:]]+([0-9a-f]{40})[[:space:]]+[^[:space:]].*$/\1/p' .gitleaksignore)
+          fi
           octopus=0
           while read -r sha; do
             [ -n "$sha" ] || continue
-            if [ "$MODE" = "diff" ]; then
+            if [ "$MODE" = "full" ] && grep -qx "$sha" <<< "$reviewed"; then
+              echo "::notice title=Octopus merge reviewed::Commit $sha merges three or more parents and is marked as reviewed in .gitleaksignore."
+            elif [ "$MODE" = "diff" ]; then
               octopus=$((octopus + 1))
               echo "::error title=Gitleaks can't scan this merge::Commit $sha merges three or more parents. Gitleaks can't see what it added, so the gate blocks it. Merge one branch at a time."
             else
-              echo "::warning title=Gitleaks can't scan this merge::Commit $sha merges three or more parents. Gitleaks couldn't check what it added. Review it by hand once."
+              octopus=$((octopus + 1))
+              echo "::error title=Gitleaks can't scan this merge::Commit $sha merges three or more parents, so Gitleaks couldn't check what it added. Check the merge by hand, then add '# reviewed-merge $sha <reason>' to .gitleaksignore."
             fi
           done <<< "$(git rev-list --min-parents=3 "$range")"
           echo "octopus=$octopus" >> "$GITHUB_OUTPUT"
@@ -624,7 +636,11 @@ jobs:
         # so code scanning would mark every existing alert as fixed. Pull
         # requests get annotations on the diff instead, and fork pull requests
         # (read-only token) never reach this step.
-        if: always() && steps.scan.outcome == 'success' && inputs.upload-sarif && steps.scope.outputs.mode == 'full'
+        # A history with an unreviewed octopus merge was only partly scanned,
+        # so its report doesn't upload either.
+        if: >-
+          always() && steps.scan.outcome == 'success' && inputs.upload-sarif && steps.scope.outputs.mode == 'full' &&
+          steps.scan.outputs.octopus == '0'
         uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: ${{ runner.temp }}/gitleaks-upload.sarif
