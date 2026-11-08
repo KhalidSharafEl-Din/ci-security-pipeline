@@ -125,7 +125,7 @@ Each tool keeps its own suppression format. The workflow requires a reason on ea
 exec(cmd, cb); // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process -- cmd is a constant
 ```
 
-Semgrep accepts the marker in many spellings: any letter case, with or without a space or comment marker before it, on the line itself or the line above. The check doesn't copy those rules. It treats any text containing `nosem` as a marker, so no spelling gets past it. A bare `nosemgrep`, `#nosemgrep`, `NOSEMGREP` or `// TODO nosem`, or any marker without both a rule ID and a reason, fails the gate. A word that merely contains `nosem` gets flagged too, so reword it. To skip whole paths, such as generated code or test fixtures, add a `.semgrepignore` file and explain each path in a comment.
+Semgrep accepts the marker in many spellings: any letter case, with or without a space or comment marker before it, on the line itself or the line above. The check doesn't copy those rules. It treats any text containing `nosem` as a marker, so no spelling gets past it. A bare `nosemgrep`, `#nosemgrep`, `NOSEMGREP` or `// TODO nosem`, or any marker without both a rule ID and a reason, fails the gate. A word that merely contains `nosem` gets flagged too, so reword it. The check only reads files Semgrep scanned, so paths in `.semgrepignore` are skipped. To skip whole paths, such as generated code or test fixtures, add a `.semgrepignore` file and explain each path in a comment.
 
 **OSV-Scanner.** Add an entry to `osv-scanner.toml` next to the lockfile. Both `reason` and `ignoreUntil` are required, so the decision comes back for review when it expires. A `[[PackageOverrides]]` entry, which can hide every advisory for a package, needs a `reason` and an `effectiveUntil` date:
 
@@ -140,7 +140,8 @@ reason = "Only called with constant templates and no options. Upgrade needs the 
 
 - For a real secret, rotate it first, then use the form with the commit SHA. It covers that one commit, so the same value committed again still fails.
 - For a false positive that stays in the code, use the form without the commit. It keeps working after a squash or rebase merge changes the commit SHA. It also silences any future match of that rule on that line, so keep these entries few.
-- On repositories that rebase-merge, a rotated secret that stays in history gets a new commit SHA on `main`. Add a second entry from the full scan on `main` after the merge.
+
+On repositories that rebase-merge, a rotated secret that stays in history gets a new commit SHA on `main`, so add a second entry from the full scan on `main` after the merge.
 
 ```
 # Rotated on 2026-11-08, the key in this commit no longer works.
@@ -152,7 +153,7 @@ tests/fixtures/sample.yml:generic-api-key:3
 
 The workflow runs Gitleaks with `--ignore-gitleaks-allow`, so inline `gitleaks:allow` comments have no effect. Every exception goes through `.gitleaksignore`, where it needs a reason.
 
-**Scanner configuration.** `.gitleaks.toml`, `.semgrepignore` and `osv-scanner.toml` can switch rules off for whole paths, and the workflow can't judge whether that's justified. On pull requests it adds a warning to every changed scanner config file. Put those files under a `CODEOWNERS` entry that requires a security reviewer.
+**Scanner configuration.** `.gitleaks.toml`, `.semgrepignore` and `osv-scanner.toml` can switch rules off for whole paths, and the workflow can't judge whether that's justified. `.gitattributes` gets the same warning. The workflow already reads every text file as text during the scan, so a `-diff` line can't hide content from the checks. On pull requests it adds a warning to every changed scanner config file. Put those files under a `CODEOWNERS` entry that requires a security reviewer.
 
 ## Hardening choices
 
@@ -160,7 +161,7 @@ The workflow runs Gitleaks with `--ignore-gitleaks-allow`, so inline `gitleaks:a
 - The scanners are pinned too. The Semgrep container is pinned by digest, and the OSV-Scanner and Gitleaks downloads are checked against the SHA-256 checksums published with each release before they run.
 - Dependabot updates the pinned actions weekly, with a 7-day cooldown before it proposes a new release. Dependabot can't see the scanner pins, so `scripts/update-tool-pins.sh` refreshes them and verifies the checksums, and a weekly job in this repo warns when they're behind.
 - The workflow starts with `permissions: {}`, and each job asks only for what it uses. The gate job has no token permissions at all.
-- It runs on `pull_request`, never `pull_request_target`, so code from a fork never runs with a write token or secrets. Fork pull requests get a read-only token. That's enough, because pull request scans never upload to code scanning, and the gate doesn't depend on the upload.
+- It runs on `pull_request`, never `pull_request_target`, so code from a fork never runs with a write token or secrets. Called from `pull_request_target` or `workflow_run`, it fails instead of quietly scanning the base branch. Fork pull requests get a read-only token. That's enough, because pull request scans never upload to code scanning, and the gate doesn't depend on the upload.
 - Checkouts use `persist-credentials: false`, so the token isn't left in `.git/config` for later steps to read.
 - Inputs and event data reach shell scripts through environment variables, never through `${{ }}` inside `run:`, which closes off script injection.
 - Gitleaks runs with `--redact`, so secret values stay out of logs, SARIF and artifacts.
@@ -181,6 +182,7 @@ Trivy's March 2026 compromise wasn't the reason. The fix for that risk is pinnin
 - It runs on `ubuntu-24.04` x64 runners. It uses Docker for Semgrep and Linux binaries for the other scanners.
 - It fetches the full git history (`fetch-depth: 0`) so it can compare against the baseline and scan every commit. Very large repositories will notice the checkout time.
 - `p/default` uses Semgrep's free community rules, which match within a single file. Cross-file taint tracking needs Semgrep's paid engine.
+- A pull request blocks on any octopus merge it brings in, even one already marked as reviewed on another branch, for example when merging `main` into a release branch. Pull requests have no reviewed-merge override, so an admin has to bypass the check for that merge.
 - Merge queue support hasn't run for real. Merge queues need an organization repository, and this one belongs to a personal account. The `merge_group` path uses the base commit GitHub documents for the event.
 - Generic secret rules have gaps. In [pull request #4](https://github.com/KhalidSharafEl-Din/ci-security-pipeline/pull/4), Gitleaks' generic API key rule skipped a random test key that contained the word "PUSH", and Semgrep's generic secret rule caught it. Running both is deliberate, and neither replaces GitHub's push protection.
 - A full scan blocks on every finding in the repository that meets the threshold. See "Adopting it on an existing codebase" below.
@@ -194,7 +196,7 @@ Pull requests only see new findings, so they work from day one. Runs on `push` a
 3. For dependencies, upgrade what's cheap. Add an `osv-scanner.toml` entry with a reason and an `ignoreUntil` date for the rest.
 4. For code, fix the blocking Semgrep findings or suppress them with a reason. Use `severity-threshold: critical` for a while if the list is long, and lower it once the backlog is gone.
 5. If Semgrep times out on large generated or minified files, add them to `.semgrepignore` with a comment. A timeout blocks the gate, because those files were never analysed.
-6. Migrate existing suppressions. The first run lists every `nosemgrep` comment without a rule ID and reason, `.gitleaksignore` entry without a comment, and `osv-scanner.toml` entry without an expiry. Inline `gitleaks:allow` comments stop working, so move those to `.gitleaksignore`.
+6. Migrate existing suppressions. The first run lists every `nosemgrep` comment without a rule ID and reason, `.gitleaksignore` entry without a comment, and `osv-scanner.toml` entry without a reason or an expiry. Inline `gitleaks:allow` comments stop working, so move those to `.gitleaksignore`.
 
 ## Repository layout
 
