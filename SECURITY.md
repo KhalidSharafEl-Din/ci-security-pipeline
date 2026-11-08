@@ -14,4 +14,4 @@ The `demo/` app ships a vulnerable lodash version on purpose in the demo pull re
 
 ## Supported versions
 
-Only the latest commit on `main` gets fixes. Pin the workflow to a commit SHA and update it when a fix lands.
+Fixes ship in a new release. Pin the workflow to the SHA of the latest release.

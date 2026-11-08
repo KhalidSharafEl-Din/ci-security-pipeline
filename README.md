@@ -6,9 +6,9 @@ A reusable GitHub Actions workflow that runs three security scanners on every pu
 - **SCA** with [OSV-Scanner](https://google.github.io/osv-scanner/) finds dependencies with known vulnerabilities.
 - **Secret scanning** with [Gitleaks](https://github.com/gitleaks/gitleaks) finds credentials committed to git, including ones deleted in a later commit.
 
-Each scanner uploads its results to GitHub code scanning. A final `gate` job fails the pull request when the change adds a high or critical finding, so you only need to make one check required. Findings that were already on the target branch don't block the pull request.
+On pushes and scheduled runs, each scanner also uploads its results to GitHub code scanning. A final `gate` job fails the pull request when the change adds a high or critical finding, so you only need to make one check required. Findings that were already on the target branch don't block the pull request.
 
-I built this to show how I set up pipeline security: pinned and verified tools, least-privilege tokens, a gate that fails closed, and a written reason for every `nosemgrep` comment and ignore-file entry.
+I built this to show how I set up pipeline security: pinned and verified tools, least-privilege tokens, a gate that fails closed, and a required reason on every inline suppression, `.gitleaksignore` block and `osv-scanner.toml` entry.
 
 ## See it work
 
@@ -115,7 +115,7 @@ On pull requests, new findings show up as annotations on the diff and in the job
 
 ## Suppressing a false positive
 
-Each tool keeps its own suppression format, and the workflow checks that every entry explains itself.
+Each tool keeps its own suppression format. The workflow requires a reason on each inline comment and ignore entry. Changes to whole-path config files get a reviewer warning instead.
 
 **Semgrep.** Put the comment on the line of the finding, with the rule ID and a reason after ` -- `. Separate several rule IDs with commas:
 
