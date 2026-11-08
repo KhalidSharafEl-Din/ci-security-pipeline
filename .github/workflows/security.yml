@@ -322,10 +322,10 @@ jobs:
           VIOLATIONS: ${{ steps.suppressions.outputs.violations }}
         run: |
           set -euo pipefail
-          # shellcheck disable=SC2016 # jq programs use $vars on purpose
           out="$RUNNER_TEMP/osv"
           # Flatten to one row per (lockfile, package, advisory). Paths are made
           # relative so the head and baseline scans can be compared.
+          # shellcheck disable=SC2016 # $src and friends are jq variables
           flatten='[.results[]? | .source.path as $src | .packages[]? | .package as $p | .groups[]? |
             ($src | ltrimstr($root) | ltrimstr("/")) as $file |
             {key: ($file + " " + $p.ecosystem + "/" + $p.name + " " + .ids[0]),
