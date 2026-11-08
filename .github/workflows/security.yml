@@ -185,19 +185,24 @@ jobs:
           valid='nose[m]([g]rep)?[:=] *[A-Za-z0-9_.-]+( *, *[A-Za-z0-9_.-]+)* +-- +[^ ]'
           if [ "$MODE" = "diff" ]; then
             # Pull requests only answer for the lines they add.
-            lines=$(git diff -U0 --no-color --text "$BASELINE" HEAD -- . ':!*.md' | awk '
+            lines=$(git -c core.quotePath=false diff -U0 --no-color --text "$BASELINE" HEAD -- . ':!*.md' | awk '
               /^diff --git / { header = 1; next }
-              header && /^\+\+\+ / { file = substr($0, 7); header = 0; next }
+              header && /^\+\+\+ / { file = substr($0, 7); sub(/\t$/, "", file); header = 0; next }
               /^@@ / { split($3, range, ","); line = substr(range[1], 2) + 0; next }
               !header && /^\+/ { print file ":" line ":" substr($0, 2); line++ }')
           else
-            lines=$(git grep -a -niE "$marker" -- ':!*.md' || true)
+            lines=$(git -c core.quotePath=false grep -a -niE "$marker" -- ':!*.md' || true)
           fi
           # A marker can only suppress something in a file Semgrep scanned, so
-          # files it skipped (.semgrepignore, unsupported types) don't count.
-          jq -r '.paths.scanned[]?' "$RUNNER_TEMP/semgrep/semgrep.json" > "$RUNNER_TEMP/semgrep-scanned.txt"
+          # tracked files it skipped (.semgrepignore, unsupported types) don't
+          # count. A line is dropped only when it clearly belongs to one of
+          # those files. Anything that doesn't match cleanly stays flagged.
+          jq -r '.paths.scanned[]?' "$RUNNER_TEMP/semgrep/semgrep.json" | sort -u > "$RUNNER_TEMP/semgrep-scanned.txt"
+          git -c core.quotePath=false ls-files | sort -u |
+            comm -23 - "$RUNNER_TEMP/semgrep-scanned.txt" > "$RUNNER_TEMP/semgrep-skipped.txt"
           bad=$(printf '%s\n' "$lines" | grep -iE "$marker" | grep -viE "$valid" |
-            awk -F: 'NR == FNR { scanned[$0] = 1; next } ($1 in scanned)' "$RUNNER_TEMP/semgrep-scanned.txt" - || true)
+            awk 'NR == FNR { skipped[++n] = $0 ":"; next }
+                 { for (i = 1; i <= n; i++) if (index($0, skipped[i]) == 1) next; print }' "$RUNNER_TEMP/semgrep-skipped.txt" - || true)
           count=0
           if [ -n "$bad" ]; then
             count=$(printf '%s\n' "$bad" | wc -l)
