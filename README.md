@@ -153,7 +153,7 @@ tests/fixtures/sample.yml:generic-api-key:3
 
 The workflow runs Gitleaks with `--ignore-gitleaks-allow`, so inline `gitleaks:allow` comments have no effect. Every exception goes through `.gitleaksignore`, where it needs a reason.
 
-**Scanner configuration.** `.gitleaks.toml`, `.semgrepignore` and `osv-scanner.toml` can switch rules off for whole paths, and the workflow can't judge whether that's justified. `.gitattributes` gets the same warning. The workflow already reads every text file as text during the scan, so a `-diff` line can't hide content from the checks. On pull requests it adds a warning to every changed scanner config file. Put those files under a `CODEOWNERS` entry that requires a security reviewer.
+**Scanner configuration.** `.gitleaks.toml`, `.semgrepignore` and `osv-scanner.toml` can switch rules off for whole paths, and the workflow can't judge whether that's justified, so on pull requests it adds a warning to every changed one. Changes to `.gitattributes` get the same warning. A `-diff` line there can't hide content, because the scan reads every text file as text. Put these files under a `CODEOWNERS` entry that requires a security reviewer.
 
 ## Hardening choices
 
@@ -182,7 +182,7 @@ Trivy's March 2026 compromise wasn't the reason. The fix for that risk is pinnin
 - It runs on `ubuntu-24.04` x64 runners. It uses Docker for Semgrep and Linux binaries for the other scanners.
 - It fetches the full git history (`fetch-depth: 0`) so it can compare against the baseline and scan every commit. Very large repositories will notice the checkout time.
 - `p/default` uses Semgrep's free community rules, which match within a single file. Cross-file taint tracking needs Semgrep's paid engine.
-- A pull request blocks on any octopus merge it brings in, even one already marked as reviewed on another branch, for example when merging `main` into a release branch. Pull requests have no reviewed-merge override, so an admin has to bypass the check for that merge.
+- A pull request blocks on any octopus merge it brings in, for example when merging `main` into a release branch. The `reviewed-merge` override only applies to full scans, so an admin has to bypass the check for that pull request.
 - Merge queue support hasn't run for real. Merge queues need an organization repository, and this one belongs to a personal account. The `merge_group` path uses the base commit GitHub documents for the event.
 - Generic secret rules have gaps. In [pull request #4](https://github.com/KhalidSharafEl-Din/ci-security-pipeline/pull/4), Gitleaks' generic API key rule skipped a random test key that contained the word "PUSH", and Semgrep's generic secret rule caught it. Running both is deliberate, and neither replaces GitHub's push protection.
 - A full scan blocks on every finding in the repository that meets the threshold. See "Adopting it on an existing codebase" below.
