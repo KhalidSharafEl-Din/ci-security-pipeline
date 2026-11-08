@@ -165,6 +165,7 @@ Trivy's March 2026 compromise wasn't the reason. The fix for that risk is pinnin
 - It runs on `ubuntu-24.04` x64 runners. It uses Docker for Semgrep and Linux binaries for the other scanners.
 - It fetches the full git history (`fetch-depth: 0`) so it can compare against the baseline and scan every commit. Very large repositories will notice the checkout time.
 - `p/default` uses Semgrep's free community rules, which match within a single file. Cross-file taint tracking needs Semgrep's paid engine.
+- Generic secret rules have gaps. In [pull request #4](https://github.com/KhalidSharafEl-Din/ci-security-pipeline/pull/4), Gitleaks' generic API key rule skipped a random test key that contained the word "PUSH", and Semgrep's generic secret rule caught it. Running both is deliberate, and neither replaces GitHub's push protection.
 - A full scan blocks on every finding in the repository. See "Adopting it on an existing codebase" below.
 
 ## Adopting it on an existing codebase
