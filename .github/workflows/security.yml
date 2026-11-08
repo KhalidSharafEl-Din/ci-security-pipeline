@@ -227,15 +227,21 @@ jobs:
             jq -r --argjson min "$MIN_RANK" "$rank"' .results[] |
               "::\(if (.extra.severity | rank) >= $min then "error" else "warning" end) file=\(.path),line=\(.start.line),title=Semgrep \(.check_id)::\(.extra.message | gsub("%"; "%25") | gsub("[\r\n]+"; " ") | .[0:300])"' "$json"
           fi
-          echo "total=$total" >> "$GITHUB_OUTPUT"
-          echo "blocking=$blocking" >> "$GITHUB_OUTPUT"
+          {
+            echo "total=$total"
+            echo "blocking=$blocking"
+            echo "incomplete=$incomplete"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Upload SARIF to code scanning
         # Only full scans upload. A pull request scan holds only new findings,
         # so code scanning would mark every existing alert as fixed. Pull
         # requests get annotations on the diff instead, and fork pull requests
-        # (read-only token) never reach this step.
-        if: always() && steps.scan.outcome == 'success' && inputs.upload-sarif && steps.scope.outputs.mode == 'full'
+        # (read-only token) never reach this step. An incomplete scan doesn't
+        # upload either, for the same reason. Its report stays in the artifact.
+        if: >-
+          always() && steps.scan.outcome == 'success' && inputs.upload-sarif && steps.scope.outputs.mode == 'full' &&
+          steps.result.outcome == 'success' && steps.result.outputs.incomplete == '0'
         uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: ${{ runner.temp }}/semgrep/semgrep.sarif
@@ -509,7 +515,9 @@ jobs:
           out="$RUNNER_TEMP/gitleaks"
           mkdir -p "$out"
           # --redact keeps secret values out of the log and the SARIF file.
-          args=(git --redact --no-banner --exit-code 0
+          # --ignore-gitleaks-allow turns off inline allow comments, so every
+          # exception goes through .gitleaksignore, where it needs a reason.
+          args=(git --redact --no-banner --exit-code 0 --ignore-gitleaks-allow
                 --report-format sarif --report-path "$out/gitleaks.sarif")
           # On pull requests, scan every commit the PR adds, not only the
           # final tree, because a secret committed and then deleted still leaked.
@@ -519,6 +527,16 @@ jobs:
           if [ "$MODE" = "diff" ]; then range="${BASELINE}..HEAD"; else range="HEAD"; fi
           args+=("--log-opts=--remerge-diff ${range}")
           "$RUNNER_TEMP/bin/gitleaks" "${args[@]}" .
+          # --remerge-diff can't show what an octopus merge (three or more
+          # parents) added, so a secret could hide there. Block those merges
+          # instead of reporting a clean result.
+          octopus=$(git rev-list --min-parents=3 "$range" | wc -l)
+          if [ "$octopus" -gt 0 ]; then
+            git rev-list --min-parents=3 "$range" | while read -r sha; do
+              echo "::error title=Gitleaks can't scan this merge::Commit $sha merges three or more parents. Gitleaks can't see what it added, so the gate blocks it. Merge one branch at a time."
+            done
+          fi
+          echo "octopus=$octopus" >> "$GITHUB_OUTPUT"
 
       - name: Check suppressions have a reason
         id: suppressions
@@ -541,27 +559,6 @@ jobs:
               !covered { bad++; printf "::error file=.gitleaksignore,line=%d::Fingerprint without a reason comment above it\n", NR > "/dev/stderr" }
               END { print bad + 0 }' .gitleaksignore)
           fi
-          # An inline allow comment for Gitleaks needs a reason too, like
-          #   api_key = "test-value" # gitleaks:allow -- fixture for the parser tests
-          # The brackets stop this check matching itself.
-          marker='gitleaks:[a]llow'
-          valid='gitleaks:[a]llow +-- +[^ ]'
-          if [ "$MODE" = "diff" ]; then
-            lines=$(git diff -U0 --no-color "$BASELINE" HEAD -- . ':!*.md' | awk '
-              /^diff --git / { header = 1; next }
-              header && /^\+\+\+ / { file = substr($0, 7); header = 0; next }
-              /^@@ / { split($3, range, ","); line = substr(range[1], 2) + 0; next }
-              !header && /^\+/ { print file ":" line ":" substr($0, 2); line++ }')
-          else
-            lines=$(git grep -nE "$marker" -- ':!*.md' || true)
-          fi
-          bad=$(printf '%s\n' "$lines" | grep -E "$marker" | grep -vE "$valid" || true)
-          if [ -n "$bad" ]; then
-            count=$((count + $(printf '%s\n' "$bad" | wc -l)))
-            while IFS=: read -r file line _; do
-              echo "::error file=$file,line=$line::gitleaks:allow needs a reason: 'gitleaks:allow -- reason'"
-            done <<< "$bad"
-          fi
           # Scanner configuration can switch rules off, so flag every change to
           # it for a security reviewer. This doesn't block.
           if [ "$MODE" = "diff" ]; then
@@ -579,18 +576,19 @@ jobs:
         env:
           MODE: ${{ steps.scope.outputs.mode }}
           VIOLATIONS: ${{ steps.suppressions.outputs.violations }}
+          OCTOPUS: ${{ steps.scan.outputs.octopus }}
         run: |
           set -euo pipefail
           sarif="$RUNNER_TEMP/gitleaks/gitleaks.sarif"
           total=$(jq '[.runs[].results[]?] | length' "$sarif")
           # Any secret blocks, whatever the severity threshold.
-          blocking=$((total + VIOLATIONS))
+          blocking=$((total + VIOLATIONS + OCTOPUS))
           {
             echo "### Secrets (Gitleaks)"
             echo
             if [ "$MODE" = "diff" ]; then echo "Scope: commits added by this pull request."; else echo "Scope: full git history."; fi
             echo
-            echo "Secrets: $total. Blocking: $blocking (suppressions without a reason: $VIOLATIONS)."
+            echo "Secrets: $total. Blocking: $blocking (ignore entries without a reason: $VIOLATIONS, merges Gitleaks can't scan: $OCTOPUS)."
             if [ "$total" -gt 0 ]; then
               echo
               echo "Rotate each secret, then add its fingerprint to \`.gitleaksignore\` under a reason comment."

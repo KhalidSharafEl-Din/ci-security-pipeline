@@ -8,7 +8,7 @@ A reusable GitHub Actions workflow that runs three security scanners on every pu
 
 On pushes and scheduled runs, each scanner also uploads its results to GitHub code scanning. A final `gate` job fails the pull request when the change adds a high or critical finding, so you only need to make one check required. Findings that were already on the target branch don't block the pull request.
 
-I built this to show how I set up pipeline security: pinned and verified tools, least-privilege tokens, a gate that fails closed, and a required reason on every inline suppression, `.gitleaksignore` block and `osv-scanner.toml` entry.
+I built this to show how I set up pipeline security: pinned and verified tools, least-privilege tokens, a gate that fails closed, and a required reason on every `nosemgrep` comment, `.gitleaksignore` block and `osv-scanner.toml` entry.
 
 ## See it work
 
@@ -105,8 +105,9 @@ Within that scope, a finding blocks when:
 
 Some results that aren't findings also block, because each one means a clean result can't be trusted:
 
-- A `nosemgrep`, `gitleaks:allow`, `.gitleaksignore` block or `osv-scanner.toml` entry without a written reason. On pull requests, only the lines and ignore files the pull request changes are checked.
-- A Semgrep timeout or crash, which leaves part of the code unanalysed. Parse errors in single files are reported but don't block.
+- A `nosemgrep` comment, `.gitleaksignore` block or `osv-scanner.toml` entry without a written reason. On pull requests, only the lines and ignore files the pull request changes are checked.
+- A Semgrep timeout or crash, which leaves part of the code unanalysed. Parse errors in single files are reported but don't block. An incomplete scan also skips the code scanning upload, so existing alerts don't show as fixed.
+- A merge commit with three or more parents (an octopus merge). Gitleaks can't see what such a merge added, so the gate blocks it.
 - A pull request that removes every lockfile OSV-Scanner found on the target branch.
 - A scanner job that failed, timed out or was cancelled. The gate never reads a missing result as "no findings".
 
@@ -148,7 +149,7 @@ reason = "Only called with constant templates and no options. Upgrade needs the 
 tests/fixtures/sample.yml:generic-api-key:3
 ```
 
-Gitleaks also honors an inline allow comment. The workflow requires a reason there too, in the form `# gitleaks:allow -- test fixture for the parser`.
+The workflow runs Gitleaks with `--ignore-gitleaks-allow`, so inline `gitleaks:allow` comments have no effect. Every exception goes through `.gitleaksignore`, where it needs a reason.
 
 **Scanner configuration.** `.gitleaks.toml`, `.semgrepignore` and `osv-scanner.toml` can switch rules off for whole paths, and the workflow can't judge whether that's justified. On pull requests it adds a warning to every changed scanner config file. Put those files under a `CODEOWNERS` entry that requires a security reviewer.
 
