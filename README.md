@@ -6,7 +6,7 @@ A reusable GitHub Actions workflow that runs three security scanners on every pu
 - **SCA** with [OSV-Scanner](https://google.github.io/osv-scanner/) finds dependencies with known vulnerabilities.
 - **Secret scanning** with [Gitleaks](https://github.com/gitleaks/gitleaks) finds credentials committed to git, including ones deleted in a later commit.
 
-On pushes and scheduled runs, each scanner also uploads its results to GitHub code scanning. A final `gate` job fails the pull request when the change adds a high or critical finding, so you only need to make one check required. Findings that were already on the target branch don't block the pull request.
+On full scans (pushes, scheduled runs and manual runs), each scanner also uploads its results to GitHub code scanning. A final `gate` job fails the pull request when the change adds a high or critical finding, so you only need to make one check required. Findings that were already on the target branch don't block the pull request.
 
 I built this to show how I set up pipeline security: pinned and verified tools, least-privilege tokens, a gate that fails closed, and a required reason on every `nosemgrep` comment, `.gitleaksignore` block and `osv-scanner.toml` entry.
 
@@ -125,7 +125,7 @@ Each tool keeps its own suppression format. The workflow requires a reason on ea
 exec(cmd, cb); // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process -- cmd is a constant
 ```
 
-Semgrep honors the marker in any letter case, wherever it follows a space, so the check does too. `nosemgrep`, `NOSEMGREP`, `// TODO nosem` or any form without a rule ID and a reason fails the gate. To skip whole paths, such as generated code or test fixtures, add a `.semgrepignore` file and explain each path in a comment.
+Semgrep honors the marker in any letter case, wherever it follows a space, so the check does too. A bare `nosemgrep`, `NOSEMGREP` or `// TODO nosem`, or any marker without both a rule ID and a reason, fails the gate. To skip whole paths, such as generated code or test fixtures, add a `.semgrepignore` file and explain each path in a comment.
 
 **OSV-Scanner.** Add an entry to `osv-scanner.toml` next to the lockfile. Both `reason` and `ignoreUntil` are required, so the decision comes back for review when it expires. A `[[PackageOverrides]]` entry, which can hide every advisory for a package, needs a `reason` and an `effectiveUntil` date:
 
