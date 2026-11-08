@@ -598,9 +598,12 @@ jobs:
                 "| `\(.ruleId)` | `\($loc.artifactLocation.uri):\($loc.region.startLine)` | `\(.partialFingerprints.commitSha):\($loc.artifactLocation.uri):\(.ruleId):\($loc.region.startLine)` |"' "$sarif"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+          # Findings from a merge resolution carry a "b/" path prefix from the
+          # remerge diff. The annotation strips it. The fingerprint keeps it,
+          # because that's the string Gitleaks matches against .gitleaksignore.
           if [ "$MODE" = "diff" ]; then
             jq -r '.runs[].results[] | .locations[0].physicalLocation as $loc |
-              "::error file=\($loc.artifactLocation.uri),line=\($loc.region.startLine),title=Gitleaks \(.ruleId)::Possible secret. Rotate it, then add the fingerprint from the job summary to .gitleaksignore."' "$sarif"
+              "::error file=\($loc.artifactLocation.uri | sub("^b/"; "")),line=\($loc.region.startLine),title=Gitleaks \(.ruleId)::Possible secret. Rotate it, then add the fingerprint from the job summary to .gitleaksignore."' "$sarif"
           fi
           echo "total=$total" >> "$GITHUB_OUTPUT"
           echo "blocking=$blocking" >> "$GITHUB_OUTPUT"
