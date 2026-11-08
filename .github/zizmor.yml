@@ -1,0 +1,5 @@
+rules:
+  self-repository:
+    # Reusable workflows called with "./" already resolve to the same commit
+    # as the caller, with no checkout involved, so "$/" changes nothing here.
+    disable: true

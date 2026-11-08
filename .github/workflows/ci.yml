@@ -22,9 +22,9 @@ jobs:
     name: security
     uses: ./.github/workflows/security.yml
     permissions:
-      contents: read
-      security-events: write
-      actions: read
+      contents: read # check out the code
+      security-events: write # upload SARIF to code scanning
+      actions: read # code scanning reads the run metadata on private repos
     with:
       # Code scanning needs a public repo or GitHub Code Security.
       upload-sarif: ${{ !github.event.repository.private }}

@@ -68,9 +68,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
-      contents: read
-      security-events: write
-      actions: read
+      contents: read # check out the code
+      security-events: write # upload SARIF to code scanning
+      actions: read # code scanning reads the run metadata on private repos
     outputs:
       blocking: ${{ steps.result.outputs.blocking }}
       total: ${{ steps.result.outputs.total }}
@@ -147,15 +147,17 @@ jobs:
         id: suppressions
         run: |
           set -euo pipefail
-          # Every nosemgrep comment must name the rule and give a reason:
+          # A nosemgrep comment must name the rule and give a reason, like
           #   // nosemgrep: rule-id -- why this is safe
-          # The bracket in the pattern stops this line from matching itself.
-          bad=$(git grep -nE 'nosem[g]rep' -- ':!*.md' | grep -vE 'nosem[g]rep: *[A-Za-z0-9_.-]+ +-- +[^ ]' || true)
+          # Only comments count, and the brackets stop this check matching itself.
+          marker='(//|#|/\*|<!--|;|--) *nosem[g]rep'
+          valid='nosem[g]rep: *[A-Za-z0-9_.-]+ +-- +[^ ]'
+          bad=$(git grep -nE "$marker" -- ':!*.md' | grep -vE "$valid" || true)
           count=0
           if [ -n "$bad" ]; then
             count=$(printf '%s\n' "$bad" | wc -l)
-            while IFS= read -r line; do
-              echo "::error file=${line%%:*}::nosemgrep without a rule ID and a reason (use 'nosemgrep: rule-id -- reason')"
+            while IFS=: read -r file line _; do
+              echo "::error file=$file,line=$line::nosemgrep needs a rule ID and a reason: 'nosemgrep: rule-id -- reason'"
             done <<< "$bad"
           fi
           echo "violations=$count" >> "$GITHUB_OUTPUT"
@@ -214,9 +216,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
-      contents: read
-      security-events: write
-      actions: read
+      contents: read # check out the code
+      security-events: write # upload SARIF to code scanning
+      actions: read # code scanning reads the run metadata on private repos
     outputs:
       blocking: ${{ steps.result.outputs.blocking }}
       total: ${{ steps.result.outputs.total }}
@@ -320,6 +322,7 @@ jobs:
           VIOLATIONS: ${{ steps.suppressions.outputs.violations }}
         run: |
           set -euo pipefail
+          # shellcheck disable=SC2016 # jq programs use $vars on purpose
           out="$RUNNER_TEMP/osv"
           # Flatten to one row per (lockfile, package, advisory). Paths are made
           # relative so the head and baseline scans can be compared.
@@ -378,9 +381,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
-      contents: read
-      security-events: write
-      actions: read
+      contents: read # check out the code
+      security-events: write # upload SARIF to code scanning
+      actions: read # code scanning reads the run metadata on private repos
     outputs:
       blocking: ${{ steps.result.outputs.blocking }}
       total: ${{ steps.result.outputs.total }}
