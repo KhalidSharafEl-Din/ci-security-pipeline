@@ -26,8 +26,9 @@ jobs:
       security-events: write # upload SARIF to code scanning
       actions: read # code scanning reads the run metadata on private repos
     with:
-      # Code scanning needs a public repo or GitHub Code Security.
-      upload-sarif: ${{ !github.event.repository.private }}
+      # Code scanning needs a public repo or GitHub Code Security. This stays
+      # false only until the repo is public.
+      upload-sarif: false
 
   workflow-lint:
     name: Workflow lint (actionlint, zizmor)

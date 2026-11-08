@@ -23,15 +23,15 @@ A scanner tells you a vulnerable version is installed. It doesn't tell you wheth
 
 **2. Does our code call the vulnerable function?** Both blocking advisories are in `_.template`, and `render.js` calls `_.template(source)`. Yes, the function is reachable.
 
-**3. Can an attacker control the input that reaches the dangerous part?** Both bugs live in options that `_.template` passes to the `Function()` constructor. CVE-2021-23337 needs control of `options.variable`. CVE-2026-4800 needs control of the key names in `options.imports`, or a polluted `Object.prototype`. Our call passes no options at all, and the template strings are constants in the file. Users only supply the values in `data`, which `<%- %>` escapes. No, not today.
+**3. Can an attacker control the input that reaches the dangerous part?** Both bugs live in options that `_.template` passes to the `Function()` constructor. CVE-2021-23337 needs control of `options.variable`. CVE-2026-4800 needs control of the key names in `options.imports`, or a polluted `Object.prototype`. Our call passes no options at all, and the template strings are constants in the file. Users only supply the values in `data`. The compiled template reads them at render time, and they never become part of the source that `Function()` compiles. No, not today.
 
-So the honest status is "reachable, not exploitable as written". That's a real distinction. It's also fragile: one future change that passes user input as options turns it into remote code execution.
+The status is "reachable, not exploitable as written". That status is fragile. One future change that passes user input as options turns it into remote code execution.
 
 ## Fix, accept or suppress
 
 When the fix is a patch or minor upgrade and the tests pass, I upgrade, even when the finding isn't exploitable. That costs a few minutes now and removes the question for every later change.
 
-I suppress only when the upgrade is expensive, for example a major version with breaking changes, and the answer to question 3 is "no". The suppression goes in `osv-scanner.toml` next to the lockfile, with the reasoning and an expiry date, so it comes back for review instead of living forever:
+I suppress only when the upgrade is expensive, for example a major version with breaking changes, and the answer to question 3 is "no". The suppression goes in `osv-scanner.toml` next to the lockfile, with the reasoning and an expiry date, so it comes back for review instead of living forever. If the upgrade here had been a breaking change, the entry would have looked like this:
 
 ```toml
 [[IgnoredVulns]]
@@ -50,11 +50,11 @@ The 2021 fix added validation for the `variable` option but left the `imports` k
 
 The third commit bumped lodash to 4.18.1, and the gate passed ([run](https://github.com/KhalidSharafEl-Din/ci-security-pipeline/actions/runs/42479443404)) with no advisories left.
 
-The lesson is about memory, not lodash. "Upgrade to the version in the advisory I remember" goes stale. The scanner checks against today's advisory data on every run, which is also why this repo runs a full scan every week: an advisory published after a merge still shows up.
+Remembered fix versions go stale. The scanner checks against today's advisory data on every run, which is also why this repo runs a full scan every week: an advisory published after a merge still shows up.
 
 ## Why the gate doesn't use reachability
 
-The gate blocks on the CVSS score of each new advisory and ignores reachability. That's a deliberate choice.
+The gate blocks on the CVSS score of each new advisory and ignores reachability.
 
 OSV-Scanner's call analysis covers Go and Rust, not JavaScript, so the tool can't answer question 2 for this app. Even where call analysis exists, it can't answer question 3, which is the one that matters. A gate that guesses at reachability would pass findings it shouldn't.
 
