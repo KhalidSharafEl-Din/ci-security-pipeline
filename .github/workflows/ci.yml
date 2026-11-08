@@ -14,7 +14,9 @@ on:
 permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Pull request runs share a group and cancel superseded ones. Other runs
+  # get one group per commit, so every commit on main keeps a result.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
