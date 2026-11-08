@@ -85,6 +85,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Read every text file as text
+        # A ".gitattributes" line such as "*.json -diff" makes git print
+        # "Binary files differ" instead of the content, which would hide
+        # secrets and suppression markers from these checks. This overrides
+        # it for the scan only. Files with real binary content stay binary.
+        run: echo '* !diff' >> "$(git rev-parse --git-path info/attributes)"
+
       - name: Check out extra rules
         if: inputs.semgrep-extra-rules-repo != ''
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -104,6 +111,13 @@ jobs:
           EXTRA_REF: ${{ inputs.semgrep-extra-rules-ref }}
         run: |
           set -euo pipefail
+          # pull_request_target and workflow_run check out the base branch, so
+          # the scan would pass without looking at the pull request's code.
+          case "$EVENT_NAME" in
+            pull_request_target|workflow_run)
+              echo "::error::Call this workflow from pull_request, not $EVENT_NAME. On $EVENT_NAME it would scan the base branch instead of the change."
+              exit 1 ;;
+          esac
           case "$THRESHOLD" in
             high) echo "min-rank=3" >> "$GITHUB_OUTPUT" ;;
             critical) echo "min-rank=4" >> "$GITHUB_OUTPUT" ;;
@@ -141,11 +155,12 @@ jobs:
           out="$RUNNER_TEMP/semgrep"
           mkdir -p "$out"
           args=(scan --metrics=off --disable-version-check
-                --exclude=.semgrep-extra-rules
                 --sarif-output=/out/semgrep.sarif --json-output=/out/semgrep.json)
           read -r -a configs <<< "$SEMGREP_CONFIG"
           for c in "${configs[@]}"; do args+=(--config "$c"); done
-          if [ -n "$EXTRA_REPO" ]; then args+=(--config ".semgrep-extra-rules/$EXTRA_PATH"); fi
+          if [ -n "$EXTRA_REPO" ]; then
+            args+=(--config ".semgrep-extra-rules/$EXTRA_PATH" --exclude=.semgrep-extra-rules)
+          fi
           if [ "$MODE" = "diff" ]; then args+=(--baseline-commit "$BASELINE"); fi
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/src" -v "$out:/out" -w /src \
@@ -162,23 +177,27 @@ jobs:
           # Semgrep accepts its suppression marker in many spellings: any case,
           # with or without a comment marker or a space before it, on the line
           # or the line above. Rather than copy those rules, this check treats
-          # any text that starts like the marker as one. Each must name the rule and give
-          # a reason, like this:
+          # any text that contains the marker as one. Each must name the rule
+          # and give a reason, like this:
           #   // nosemgrep: rule-id -- why this is safe
           # The bracket stops this check matching itself.
           marker='nose[m]'
           valid='nose[m]([g]rep)?[:=] *[A-Za-z0-9_.-]+( *, *[A-Za-z0-9_.-]+)* +-- +[^ ]'
           if [ "$MODE" = "diff" ]; then
             # Pull requests only answer for the lines they add.
-            lines=$(git diff -U0 --no-color "$BASELINE" HEAD -- . ':!*.md' | awk '
+            lines=$(git diff -U0 --no-color --text "$BASELINE" HEAD -- . ':!*.md' | awk '
               /^diff --git / { header = 1; next }
               header && /^\+\+\+ / { file = substr($0, 7); header = 0; next }
               /^@@ / { split($3, range, ","); line = substr(range[1], 2) + 0; next }
               !header && /^\+/ { print file ":" line ":" substr($0, 2); line++ }')
           else
-            lines=$(git grep -niE "$marker" -- ':!*.md' || true)
+            lines=$(git grep -a -niE "$marker" -- ':!*.md' || true)
           fi
-          bad=$(printf '%s\n' "$lines" | grep -iE "$marker" | grep -viE "$valid" || true)
+          # A marker can only suppress something in a file Semgrep scanned, so
+          # files it skipped (.semgrepignore, unsupported types) don't count.
+          jq -r '.paths.scanned[]?' "$RUNNER_TEMP/semgrep/semgrep.json" > "$RUNNER_TEMP/semgrep-scanned.txt"
+          bad=$(printf '%s\n' "$lines" | grep -iE "$marker" | grep -viE "$valid" |
+            awk -F: 'NR == FNR { scanned[$0] = 1; next } ($1 in scanned)' "$RUNNER_TEMP/semgrep-scanned.txt" - || true)
           count=0
           if [ -n "$bad" ]; then
             count=$(printf '%s\n' "$bad" | wc -l)
@@ -292,6 +311,13 @@ jobs:
           THRESHOLD: ${{ inputs.severity-threshold }}
         run: |
           set -euo pipefail
+          # pull_request_target and workflow_run check out the base branch, so
+          # the scan would pass without looking at the pull request's code.
+          case "$EVENT_NAME" in
+            pull_request_target|workflow_run)
+              echo "::error::Call this workflow from pull_request, not $EVENT_NAME. On $EVENT_NAME it would scan the base branch instead of the change."
+              exit 1 ;;
+          esac
           case "$THRESHOLD" in
             high) echo "min-score=7.0" >> "$GITHUB_OUTPUT" ;;
             critical) echo "min-score=9.0" >> "$GITHUB_OUTPUT" ;;
@@ -479,6 +505,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Read every text file as text
+        # A ".gitattributes" line such as "*.json -diff" makes git print
+        # "Binary files differ" instead of the content, which would hide
+        # secrets and suppression markers from these checks. This overrides
+        # it for the scan only. Files with real binary content stay binary.
+        run: echo '* !diff' >> "$(git rev-parse --git-path info/attributes)"
+
       - name: Install Gitleaks
         run: |
           set -euo pipefail
@@ -496,6 +529,13 @@ jobs:
           MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
+          # pull_request_target and workflow_run check out the base branch, so
+          # the scan would pass without looking at the pull request's code.
+          case "$EVENT_NAME" in
+            pull_request_target|workflow_run)
+              echo "::error::Call this workflow from pull_request, not $EVENT_NAME. On $EVENT_NAME it would scan the base branch instead of the change."
+              exit 1 ;;
+          esac
           if [ "$EVENT_NAME" = "pull_request" ]; then
             echo "mode=diff" >> "$GITHUB_OUTPUT"
             echo "baseline=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
@@ -530,11 +570,9 @@ jobs:
           "$RUNNER_TEMP/bin/gitleaks" "${args[@]}" .
           # --remerge-diff can't show what an octopus merge (three or more
           # parents) added, so a secret could hide there. A pull request that
-          # adds one is blocked. Full scans only warn, because an old octopus
-          # merge in history can't be undone.
-          # A pull request that adds one is blocked. In a full scan, an old
-          # octopus merge blocks until someone has checked it by hand and
-          # recorded that in .gitleaksignore with a reason:
+          # adds one is blocked. In a full scan, an old octopus merge blocks
+          # until someone has checked it by hand and recorded that in
+          # .gitleaksignore with a reason:
           #   # reviewed-merge <full commit SHA> <reason>
           reviewed=""
           if [ -f .gitleaksignore ]; then
@@ -576,6 +614,7 @@ jobs:
           if [ -f .gitleaksignore ] && [ "$check" = true ]; then
             count=$(awk '
               /^[[:space:]]*$/ { covered = 0; next }
+              /^[[:space:]]*#[[:space:]]*reviewed-merge[[:space:]]/ { covered = 0; next }
               /^[[:space:]]*#[[:space:]]*[^[:space:]]/ { covered = 1; next }
               /^[[:space:]]*#/ { covered = 0; next }
               !covered { bad++; printf "::error file=.gitleaksignore,line=%d::Fingerprint without a reason comment above it\n", NR > "/dev/stderr" }
@@ -584,7 +623,7 @@ jobs:
           # Scanner configuration can switch rules off, so flag every change to
           # it for a security reviewer. This doesn't block.
           if [ "$MODE" = "diff" ]; then
-            changed=$(git diff --name-only "$BASELINE" HEAD -- .gitleaks.toml .gitleaksignore .semgrepignore '*osv-scanner.toml' || true)
+            changed=$(git diff --name-only "$BASELINE" HEAD -- .gitattributes '*/.gitattributes' .gitleaks.toml .gitleaksignore .semgrepignore '*osv-scanner.toml' || true)
             if [ -n "$changed" ]; then
               while IFS= read -r file; do
                 echo "::warning file=$file::This pull request changes scanner configuration. Ask a security reviewer to approve it."
