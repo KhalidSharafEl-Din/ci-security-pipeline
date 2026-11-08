@@ -196,13 +196,22 @@ jobs:
           rank='def rank: {"CRITICAL":4,"HIGH":3,"ERROR":3,"MEDIUM":2,"WARNING":2,"LOW":1,"INFO":1}[.] // 0;'
           total=$(jq '.results | length' "$json")
           high=$(jq --argjson min "$MIN_RANK" "$rank"' [.results[] | select(.extra.severity | rank >= $min)] | length' "$json")
-          blocking=$((high + VIOLATIONS))
+          # A timeout or crash means part of the code was never analysed, so a
+          # clean result can't be trusted. Parse errors in single files are
+          # reported but don't block, because Semgrep still scans the rest.
+          incomplete_filter='[.errors[]? | select(.level == "error" or ((.type | if type == "array" then .[0] else . end | tostring) | test("Timeout|OutOfMemory|StackOverflow|Fatal")))]'
+          incomplete=$(jq "$incomplete_filter | length" "$json")
+          errors=$(jq '[.errors[]?] | length' "$json")
+          jq -r "$incomplete_filter"' | .[] | "::error title=Semgrep incomplete analysis::\(.type | tostring) \(.path // "" ) \(.message // "" | gsub("%"; "%25") | gsub("[\r\n]+"; " ") | .[0:200])"' "$json"
+          blocking=$((high + VIOLATIONS + incomplete))
           {
             echo "### SAST (Semgrep)"
             echo
             if [ "$MODE" = "diff" ]; then echo "Scope: findings new in this pull request."; else echo "Scope: full scan."; fi
             echo
-            echo "Findings: $total. Blocking: $blocking (suppressions without a reason: $VIOLATIONS)."
+            echo "Findings: $total. Blocking: $blocking (suppressions without a reason: $VIOLATIONS, incomplete analysis: $incomplete)."
+            echo
+            echo "Scanner errors: $errors. Timeouts and crashes block the gate. Parse errors in single files are reported only, and are listed in the semgrep-report artifact."
             if [ "$total" -gt 0 ]; then
               echo
               echo "| Severity | Rule | Location | Gate |"
@@ -305,8 +314,8 @@ jobs:
             local format=$1 file=$2 rc=0
             "$RUNNER_TEMP/bin/osv-scanner" scan source -r --format "$format" --output-file "$file" "${paths[@]}" || rc=$?
             case "$rc" in
-              0|1) ;;
-              128) echo '{"results":[]}' > "$file" ;;
+              0|1) echo found > "$file.status" ;;
+              128) echo '{"results":[]}' > "$file"; echo none > "$file.status" ;;
               *) echo "::error::osv-scanner exited with $rc"; return "$rc" ;;
             esac
           }
@@ -320,6 +329,7 @@ jobs:
             (cd "$RUNNER_TEMP/baseline" && osv json "$out/base.json")
           else
             echo '{"results":[]}' > "$out/base.json"
+            echo none > "$out/base.json.status"
           fi
 
       - name: Check suppressions have a reason
@@ -349,6 +359,17 @@ jobs:
                   if problems:
                       violations += 1
                       print(f"::error file={path}::Ignored vulnerability {entry.get('id', '?')} needs {' and '.join(problems)}")
+              # Package overrides can hide every advisory for a package, so they
+              # need the same reason and expiry as single ignores.
+              for entry in config.get("PackageOverrides", []):
+                  problems = []
+                  if not str(entry.get("reason", "")).strip():
+                      problems.append("a reason")
+                  if "effectiveUntil" not in entry:
+                      problems.append("an effectiveUntil date")
+                  if problems:
+                      violations += 1
+                      print(f"::error file={path}::Package override for {entry.get('name', 'all packages')} needs {' and '.join(problems)}")
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"violations={violations}\n")
 
@@ -380,13 +401,24 @@ jobs:
           ' "$out/head-rows.json" > "$out/rows.json"
           total=$(jq 'length' "$out/rows.json")
           vulns=$(jq '[.[] | select(.blocks)] | length' "$out/rows.json")
-          blocking=$((vulns + VIOLATIONS))
+          # Losing every lockfile is not the same as having no vulnerabilities.
+          # If the baseline had lockfiles and this change has none, block.
+          lost=0
+          if [ "$(cat "$out/base.json.status")" = found ] && [ "$(cat "$out/head.json.status")" = none ]; then
+            lost=1
+            echo "::error title=OSV-Scanner coverage lost::The target branch has lockfiles under sca-paths, but this change has none. Restore the lockfile or change sca-paths."
+          fi
+          coverage="lockfiles found"
+          if [ "$(cat "$out/head.json.status")" = none ]; then coverage="no lockfiles found under sca-paths"; fi
+          blocking=$((vulns + VIOLATIONS + lost))
           {
             echo "### SCA (OSV-Scanner)"
             echo
             if [ "$MODE" = "diff" ]; then echo "Scope: advisories new in this pull request."; else echo "Scope: full scan."; fi
             echo
-            echo "Advisories: $total. Blocking: $blocking (ignore entries without a reason or expiry: $VIOLATIONS)."
+            echo "Coverage: $coverage."
+            echo
+            echo "Advisories: $total. Blocking: $blocking (ignore entries without a reason or expiry: $VIOLATIONS, lockfiles lost: $lost)."
             if [ "$total" -gt 0 ]; then
               echo
               echo "| Advisory | CVE | Package | CVSS | Lockfile | New | Gate |"
@@ -479,8 +511,10 @@ jobs:
           # On pull requests, scan every commit the PR adds, not only the
           # final tree, because a secret committed and then deleted still leaked.
           # Full scans cover the history of the checked-out commit, not every
-          # fetched branch.
-          if [ "$MODE" = "diff" ]; then args+=("--log-opts=${BASELINE}..HEAD"); else args+=("--log-opts=HEAD"); fi
+          # fetched branch. --remerge-diff adds what a merge commit changed
+          # while resolving conflicts, which plain "git log -p" leaves out.
+          if [ "$MODE" = "diff" ]; then range="${BASELINE}..HEAD"; else range="HEAD"; fi
+          args+=("--log-opts=--remerge-diff ${range}")
           "$RUNNER_TEMP/bin/gitleaks" "${args[@]}" .
 
       - name: Check suppressions have a reason
@@ -499,9 +533,41 @@ jobs:
           if [ -f .gitleaksignore ] && [ "$check" = true ]; then
             count=$(awk '
               /^[[:space:]]*$/ { covered = 0; next }
-              /^[[:space:]]*#/ { covered = 1; next }
+              /^[[:space:]]*#[[:space:]]*[^[:space:]]/ { covered = 1; next }
+              /^[[:space:]]*#/ { covered = 0; next }
               !covered { bad++; printf "::error file=.gitleaksignore,line=%d::Fingerprint without a reason comment above it\n", NR > "/dev/stderr" }
               END { print bad + 0 }' .gitleaksignore)
+          fi
+          # An inline allow comment for Gitleaks needs a reason too, like
+          #   api_key = "test-value" # gitleaks:allow -- fixture for the parser tests
+          # The brackets stop this check matching itself.
+          marker='gitleaks:[a]llow'
+          valid='gitleaks:[a]llow +-- +[^ ]'
+          if [ "$MODE" = "diff" ]; then
+            lines=$(git diff -U0 --no-color "$BASELINE" HEAD -- . ':!*.md' | awk '
+              /^diff --git / { header = 1; next }
+              header && /^\+\+\+ / { file = substr($0, 7); header = 0; next }
+              /^@@ / { split($3, range, ","); line = substr(range[1], 2) + 0; next }
+              !header && /^\+/ { print file ":" line ":" substr($0, 2); line++ }')
+          else
+            lines=$(git grep -nE "$marker" -- ':!*.md' || true)
+          fi
+          bad=$(printf '%s\n' "$lines" | grep -E "$marker" | grep -vE "$valid" || true)
+          if [ -n "$bad" ]; then
+            count=$((count + $(printf '%s\n' "$bad" | wc -l)))
+            while IFS=: read -r file line _; do
+              echo "::error file=$file,line=$line::gitleaks:allow needs a reason: 'gitleaks:allow -- reason'"
+            done <<< "$bad"
+          fi
+          # Scanner configuration can switch rules off, so flag every change to
+          # it for a security reviewer. This doesn't block.
+          if [ "$MODE" = "diff" ]; then
+            changed=$(git diff --name-only "$BASELINE" HEAD -- .gitleaks.toml .gitleaksignore .semgrepignore '*osv-scanner.toml' || true)
+            if [ -n "$changed" ]; then
+              while IFS= read -r file; do
+                echo "::warning file=$file::This pull request changes scanner configuration. Ask a security reviewer to approve it."
+              done <<< "$changed"
+            fi
           fi
           echo "violations=$count" >> "$GITHUB_OUTPUT"
 
@@ -521,7 +587,7 @@ jobs:
             echo
             if [ "$MODE" = "diff" ]; then echo "Scope: commits added by this pull request."; else echo "Scope: full git history."; fi
             echo
-            echo "Secrets: $total. Blocking: $blocking (ignore entries without a reason: $VIOLATIONS)."
+            echo "Secrets: $total. Blocking: $blocking (suppressions without a reason: $VIOLATIONS)."
             if [ "$total" -gt 0 ]; then
               echo
               echo "Rotate each secret, then add its fingerprint to \`.gitleaksignore\` under a reason comment."

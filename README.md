@@ -102,9 +102,14 @@ Within that scope, a finding blocks when:
 | OSV-Scanner | The advisory is new and its CVSS score is 7.0 or more (9.0 or more for `critical`). Malicious-package advisories (`MAL-` IDs) have no score and always block. Advisories with no score are reported as "unknown" and don't block. |
 | Gitleaks | Always. A leaked secret needs rotating whatever its type. |
 
-Every suppression without a written reason also counts as one blocking finding, and so does a scanner that crashed, timed out or was cancelled. The gate never reads a missing result as "no findings". On pull requests, the suppression check only looks at the lines and ignore files the pull request changes.
+Some results that aren't findings also block, because each one means a clean result can't be trusted:
 
-The baseline for "new" findings is different for each tool. Semgrep uses `--baseline-commit`. OSV-Scanner scans the baseline in a separate git worktree and compares advisories per lockfile and package. Gitleaks scans only the commits the pull request adds, which also catches a secret that was added and deleted again inside the same pull request.
+- A `nosemgrep`, `gitleaks:allow`, `.gitleaksignore` block or `osv-scanner.toml` entry without a written reason. On pull requests, only the lines and ignore files the pull request changes are checked.
+- A Semgrep timeout or crash, which leaves part of the code unanalysed. Parse errors in single files are reported but don't block.
+- A pull request that removes every lockfile OSV-Scanner found on the target branch.
+- A scanner job that failed, timed out or was cancelled. The gate never reads a missing result as "no findings".
+
+The baseline for "new" findings is different for each tool. Semgrep uses `--baseline-commit`. OSV-Scanner scans the baseline in a separate git worktree and compares advisories per lockfile and package. Gitleaks scans only the commits the pull request adds, which also catches a secret that was added and deleted again inside the same pull request. It also reads the changes a merge commit makes while resolving conflicts (`git log --remerge-diff`), which plain `git log -p` leaves out.
 
 On pull requests, new findings show up as annotations on the diff and in the job summaries. Only full scans upload to code scanning. A pull request scan holds only the new findings, so uploading it would make code scanning mark every existing alert as fixed.
 
@@ -118,9 +123,9 @@ Each tool keeps its own suppression format, and the workflow checks that every e
 exec(cmd, cb); // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process -- cmd is a constant
 ```
 
-A bare `nosemgrep`, the short `nosem` form, or a comment with no reason fails the gate. To skip whole paths, such as generated code or test fixtures, add a `.semgrepignore` file. The workflow doesn't check `.semgrepignore` for reasons, so explain each path in a comment and review the file in code review.
+A bare `nosemgrep`, the short `nosem` form, or a comment with no reason fails the gate. To skip whole paths, such as generated code or test fixtures, add a `.semgrepignore` file and explain each path in a comment.
 
-**OSV-Scanner.** Add an entry to `osv-scanner.toml` next to the lockfile. Both `reason` and `ignoreUntil` are required, so the decision comes back for review when it expires:
+**OSV-Scanner.** Add an entry to `osv-scanner.toml` next to the lockfile. Both `reason` and `ignoreUntil` are required, so the decision comes back for review when it expires. A `[[PackageOverrides]]` entry, which can hide every advisory for a package, needs a `reason` and an `effectiveUntil` date:
 
 ```toml
 [[IgnoredVulns]]
@@ -136,7 +141,9 @@ reason = "Only called with constant templates and no options. Upgrade needs the 
 3f2a9c1e7b4d8a6f0e5c2b1a9d8c7e6f5a4b3c2d:config/app.yml:generic-api-key:12
 ```
 
-Gitleaks also honors a `gitleaks:allow` comment on the line itself. The workflow can't check those for a reason, so prefer `.gitleaksignore`.
+Gitleaks also honors an inline allow comment. The workflow requires a reason there too, in the form `# gitleaks:allow -- test fixture for the parser`.
+
+**Scanner configuration.** `.gitleaks.toml`, `.semgrepignore` and `osv-scanner.toml` can switch rules off for whole paths, and the workflow can't judge whether that's justified. On pull requests it adds a warning to every changed scanner config file. Put those files under a `CODEOWNERS` entry that requires a security reviewer.
 
 ## Hardening choices
 
@@ -166,7 +173,7 @@ Trivy's March 2026 compromise wasn't the reason. The fix for that risk is pinnin
 - It fetches the full git history (`fetch-depth: 0`) so it can compare against the baseline and scan every commit. Very large repositories will notice the checkout time.
 - `p/default` uses Semgrep's free community rules, which match within a single file. Cross-file taint tracking needs Semgrep's paid engine.
 - Generic secret rules have gaps. In [pull request #4](https://github.com/KhalidSharafEl-Din/ci-security-pipeline/pull/4), Gitleaks' generic API key rule skipped a random test key that contained the word "PUSH", and Semgrep's generic secret rule caught it. Running both is deliberate, and neither replaces GitHub's push protection.
-- A full scan blocks on every finding in the repository. See "Adopting it on an existing codebase" below.
+- A full scan blocks on every finding in the repository that meets the threshold. See "Adopting it on an existing codebase" below.
 
 ## Adopting it on an existing codebase
 
