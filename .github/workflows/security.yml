@@ -43,9 +43,13 @@ on:
         type: string
         default: .
       upload-sarif:
-        description: Upload results to GitHub code scanning. Set to false on private repos without GitHub Code Security.
+        description: Upload full-scan results to GitHub code scanning. Set to false on private repos without GitHub Code Security.
         type: boolean
         default: true
+      name:
+        description: Suffix for artifact names and code scanning categories. Set it when you call the workflow more than once in a run.
+        type: string
+        default: ""
     outputs:
       blocking-findings:
         description: Number of findings that failed the gate.
@@ -94,6 +98,7 @@ jobs:
         id: scope
         env:
           EVENT_NAME: ${{ github.event_name }}
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
           THRESHOLD: ${{ inputs.severity-threshold }}
           EXTRA_REPO: ${{ inputs.semgrep-extra-rules-repo }}
           EXTRA_REF: ${{ inputs.semgrep-extra-rules-ref }}
@@ -112,9 +117,13 @@ jobs:
           fi
           # On pull requests the checkout is the merge commit, so its first
           # parent is the target branch. Findings already there are not new.
-          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+          # In a merge queue the event names the base commit of the group.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
             echo "mode=diff" >> "$GITHUB_OUTPUT"
             echo "baseline=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            echo "mode=diff" >> "$GITHUB_OUTPUT"
+            echo "baseline=$MERGE_GROUP_BASE" >> "$GITHUB_OUTPUT"
           else
             echo "mode=full" >> "$GITHUB_OUTPUT"
           fi
@@ -145,14 +154,27 @@ jobs:
 
       - name: Check suppressions have a reason
         id: suppressions
+        env:
+          MODE: ${{ steps.scope.outputs.mode }}
+          BASELINE: ${{ steps.scope.outputs.baseline }}
         run: |
           set -euo pipefail
-          # A nosemgrep comment must name the rule and give a reason, like
+          # A nosemgrep (or nosem) comment must name the rule and give a reason:
           #   // nosemgrep: rule-id -- why this is safe
           # Only comments count, and the brackets stop this check matching itself.
-          marker='(//|#|/\*|<!--|;|--) *nosem[g]rep'
-          valid='nosem[g]rep: *[A-Za-z0-9_.-]+ +-- +[^ ]'
-          bad=$(git grep -nE "$marker" -- ':!*.md' | grep -vE "$valid" || true)
+          marker='(//|#|/\*|<!--|;|--) *nosem([g]rep)?\b'
+          valid='nosem[g]rep: *[A-Za-z0-9_.-]+( *, *[A-Za-z0-9_.-]+)* +-- +[^ ]'
+          if [ "$MODE" = "diff" ]; then
+            # Pull requests only answer for the lines they add.
+            lines=$(git diff -U0 --no-color "$BASELINE" HEAD -- . ':!*.md' | awk '
+              /^diff --git / { header = 1; next }
+              header && /^\+\+\+ / { file = substr($0, 7); header = 0; next }
+              /^@@ / { split($3, range, ","); line = substr(range[1], 2) + 0; next }
+              !header && /^\+/ { print file ":" line ":" substr($0, 2); line++ }')
+          else
+            lines=$(git grep -nE "$marker" -- ':!*.md' || true)
+          fi
+          bad=$(printf '%s\n' "$lines" | grep -E "$marker" | grep -vE "$valid" || true)
           count=0
           if [ -n "$bad" ]; then
             count=$(printf '%s\n' "$bad" | wc -l)
@@ -189,25 +211,29 @@ jobs:
                 "| \(.extra.severity) | `\(.check_id)` | `\(.path):\(.start.line)` | \(if (.extra.severity | rank) >= $min then "blocks" else "reported" end) |"' "$json"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$MODE" = "diff" ]; then
+            jq -r --argjson min "$MIN_RANK" "$rank"' .results[] |
+              "::\(if (.extra.severity | rank) >= $min then "error" else "warning" end) file=\(.path),line=\(.start.line),title=Semgrep \(.check_id)::\(.extra.message | gsub("%"; "%25") | gsub("[\r\n]+"; " ") | .[0:300])"' "$json"
+          fi
           echo "total=$total" >> "$GITHUB_OUTPUT"
           echo "blocking=$blocking" >> "$GITHUB_OUTPUT"
 
       - name: Upload SARIF to code scanning
-        # Fork pull requests get a read-only token, so the upload would fail.
-        # The gate does not depend on the upload, so skipping it is safe.
-        if: >-
-          always() && steps.scan.outcome == 'success' && inputs.upload-sarif &&
-          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        # Only full scans upload. A pull request scan holds only new findings,
+        # so code scanning would mark every existing alert as fixed. Pull
+        # requests get annotations on the diff instead, and fork pull requests
+        # (read-only token) never reach this step.
+        if: always() && steps.scan.outcome == 'success' && inputs.upload-sarif && steps.scope.outputs.mode == 'full'
         uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: ${{ runner.temp }}/semgrep/semgrep.sarif
-          category: semgrep
+          category: semgrep${{ inputs.name != '' && format('-{0}', inputs.name) || '' }}
 
       - name: Keep the reports
         if: always() && steps.scan.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: semgrep-report
+          name: semgrep-report${{ inputs.name != '' && format('-{0}', inputs.name) || '' }}
           path: ${{ runner.temp }}/semgrep/
           retention-days: 14
 
@@ -243,6 +269,7 @@ jobs:
         id: scope
         env:
           EVENT_NAME: ${{ github.event_name }}
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
           THRESHOLD: ${{ inputs.severity-threshold }}
         run: |
           set -euo pipefail
@@ -251,9 +278,12 @@ jobs:
             critical) echo "min-score=9.0" >> "$GITHUB_OUTPUT" ;;
             *) echo "::error::severity-threshold must be high or critical, got '$THRESHOLD'"; exit 1 ;;
           esac
-          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+          if [ "$EVENT_NAME" = "pull_request" ]; then
             echo "mode=diff" >> "$GITHUB_OUTPUT"
             echo "baseline=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            echo "mode=diff" >> "$GITHUB_OUTPUT"
+            echo "baseline=$MERGE_GROUP_BASE" >> "$GITHUB_OUTPUT"
           else
             echo "mode=full" >> "$GITHUB_OUTPUT"
           fi
@@ -295,9 +325,17 @@ jobs:
       - name: Check suppressions have a reason
         id: suppressions
         shell: python
+        env:
+          MODE: ${{ steps.scope.outputs.mode }}
+          BASELINE: ${{ steps.scope.outputs.baseline }}
         run: |
           import os, subprocess, tomllib
-          files = subprocess.run(["git", "ls-files", "*osv-scanner.toml"], capture_output=True, text=True, check=True).stdout.split()
+          # Pull requests only answer for the ignore files they change.
+          if os.environ["MODE"] == "diff":
+              cmd = ["git", "diff", "--name-only", "--diff-filter=d", os.environ["BASELINE"], "HEAD", "--", "*osv-scanner.toml"]
+          else:
+              cmd = ["git", "ls-files", "*osv-scanner.toml"]
+          files = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.split()
           violations = 0
           for path in files:
               with open(path, "rb") as fh:
@@ -356,23 +394,28 @@ jobs:
               jq -r '.[] | "| \(.id) | \(.cve) | `\(.pkg)` | \(if .score == "" then "unknown" else .score end) | `\(.file)` | \(if .new then "yes" else "no" end) | \(if .blocks then "blocks" else "reported" end) |"' "$out/rows.json"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$MODE" = "diff" ]; then
+            jq -r '.[] | select(.new) | "::\(if .blocks then "error" else "warning" end) file=\(.file),title=OSV \(.id)::\(.pkg) \(.cve) CVSS \(if .score == "" then "unknown" else .score end)"' "$out/rows.json"
+          fi
           echo "total=$total" >> "$GITHUB_OUTPUT"
           echo "blocking=$blocking" >> "$GITHUB_OUTPUT"
 
       - name: Upload SARIF to code scanning
-        if: >-
-          always() && steps.scan.outcome == 'success' && inputs.upload-sarif &&
-          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        # Only full scans upload. A pull request scan holds only new findings,
+        # so code scanning would mark every existing alert as fixed. Pull
+        # requests get annotations on the diff instead, and fork pull requests
+        # (read-only token) never reach this step.
+        if: always() && steps.scan.outcome == 'success' && inputs.upload-sarif && steps.scope.outputs.mode == 'full'
         uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: ${{ runner.temp }}/osv/osv.sarif
-          category: osv-scanner
+          category: osv-scanner${{ inputs.name != '' && format('-{0}', inputs.name) || '' }}
 
       - name: Keep the reports
         if: always() && steps.scan.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: osv-scanner-report
+          name: osv-scanner-report${{ inputs.name != '' && format('-{0}', inputs.name) || '' }}
           path: ${{ runner.temp }}/osv/
           retention-days: 14
 
@@ -408,11 +451,15 @@ jobs:
         id: scope
         env:
           EVENT_NAME: ${{ github.event_name }}
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+          if [ "$EVENT_NAME" = "pull_request" ]; then
             echo "mode=diff" >> "$GITHUB_OUTPUT"
             echo "baseline=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            echo "mode=diff" >> "$GITHUB_OUTPUT"
+            echo "baseline=$MERGE_GROUP_BASE" >> "$GITHUB_OUTPUT"
           else
             echo "mode=full" >> "$GITHUB_OUTPUT"
           fi
@@ -430,21 +477,30 @@ jobs:
           args=(git --redact --no-banner --exit-code 0
                 --report-format sarif --report-path "$out/gitleaks.sarif")
           # On pull requests, scan every commit the PR adds, not only the
-          # final tree: a secret committed and then deleted is still leaked.
-          if [ "$MODE" = "diff" ]; then args+=("--log-opts=${BASELINE}..HEAD"); fi
+          # final tree, because a secret committed and then deleted still leaked.
+          # Full scans cover the history of the checked-out commit, not every
+          # fetched branch.
+          if [ "$MODE" = "diff" ]; then args+=("--log-opts=${BASELINE}..HEAD"); else args+=("--log-opts=HEAD"); fi
           "$RUNNER_TEMP/bin/gitleaks" "${args[@]}" .
 
       - name: Check suppressions have a reason
         id: suppressions
+        env:
+          MODE: ${{ steps.scope.outputs.mode }}
+          BASELINE: ${{ steps.scope.outputs.baseline }}
         run: |
           set -euo pipefail
-          # Each fingerprint in .gitleaksignore must sit under a "# reason" comment.
+          # Each block of fingerprints in .gitleaksignore needs a "# reason"
+          # comment right above it. A blank line ends the block. Pull requests
+          # only answer for the file when they change it.
           count=0
-          if [ -f .gitleaksignore ]; then
+          check=true
+          if [ "$MODE" = "diff" ] && git diff --quiet "$BASELINE" HEAD -- .gitleaksignore; then check=false; fi
+          if [ -f .gitleaksignore ] && [ "$check" = true ]; then
             count=$(awk '
-              /^[[:space:]]*$/ { prev = ""; next }
-              /^[[:space:]]*#/ { prev = "comment"; next }
-              { if (prev != "comment") { bad++; printf "::error file=.gitleaksignore,line=%d::Fingerprint without a reason comment above it\n", NR > "/dev/stderr" } prev = "entry" }
+              /^[[:space:]]*$/ { covered = 0; next }
+              /^[[:space:]]*#/ { covered = 1; next }
+              !covered { bad++; printf "::error file=.gitleaksignore,line=%d::Fingerprint without a reason comment above it\n", NR > "/dev/stderr" }
               END { print bad + 0 }' .gitleaksignore)
           fi
           echo "violations=$count" >> "$GITHUB_OUTPUT"
@@ -468,28 +524,37 @@ jobs:
             echo "Secrets: $total. Blocking: $blocking (ignore entries without a reason: $VIOLATIONS)."
             if [ "$total" -gt 0 ]; then
               echo
-              echo "| Rule | Location | Commit |"
+              echo "Rotate each secret, then add its fingerprint to \`.gitleaksignore\` under a reason comment."
+              echo
+              echo "| Rule | Location | Fingerprint |"
               echo "| --- | --- | --- |"
-              jq -r '.runs[].results[] | "| `\(.ruleId)` | `\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)` | `\(.partialFingerprints.commitSha // "" | .[0:12])` |"' "$sarif"
+              jq -r '.runs[].results[] | .locations[0].physicalLocation as $loc |
+                "| `\(.ruleId)` | `\($loc.artifactLocation.uri):\($loc.region.startLine)` | `\(.partialFingerprints.commitSha):\($loc.artifactLocation.uri):\(.ruleId):\($loc.region.startLine)` |"' "$sarif"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$MODE" = "diff" ]; then
+            jq -r '.runs[].results[] | .locations[0].physicalLocation as $loc |
+              "::error file=\($loc.artifactLocation.uri),line=\($loc.region.startLine),title=Gitleaks \(.ruleId)::Possible secret. Rotate it, then add the fingerprint from the job summary to .gitleaksignore."' "$sarif"
+          fi
           echo "total=$total" >> "$GITHUB_OUTPUT"
           echo "blocking=$blocking" >> "$GITHUB_OUTPUT"
 
       - name: Upload SARIF to code scanning
-        if: >-
-          always() && steps.scan.outcome == 'success' && inputs.upload-sarif &&
-          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        # Only full scans upload. A pull request scan holds only new findings,
+        # so code scanning would mark every existing alert as fixed. Pull
+        # requests get annotations on the diff instead, and fork pull requests
+        # (read-only token) never reach this step.
+        if: always() && steps.scan.outcome == 'success' && inputs.upload-sarif && steps.scope.outputs.mode == 'full'
         uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: ${{ runner.temp }}/gitleaks/gitleaks.sarif
-          category: gitleaks
+          category: gitleaks${{ inputs.name != '' && format('-{0}', inputs.name) || '' }}
 
       - name: Keep the reports
         if: always() && steps.scan.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: gitleaks-report
+          name: gitleaks-report${{ inputs.name != '' && format('-{0}', inputs.name) || '' }}
           path: ${{ runner.temp }}/gitleaks/
           retention-days: 14
 

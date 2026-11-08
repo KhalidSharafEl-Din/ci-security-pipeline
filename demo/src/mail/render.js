@@ -2,7 +2,7 @@
 
 const _ = require('lodash');
 
-// Builds the plain-text body of transactional emails from fixed templates.
+// Builds the body of transactional emails from fixed templates.
 // The template strings are written by us. Only the values in `data` come
 // from users, and `<%- %>` HTML-escapes them.
 const templates = {

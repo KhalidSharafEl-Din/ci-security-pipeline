@@ -8,7 +8,7 @@ A reusable GitHub Actions workflow that runs three security scanners on every pu
 
 Each scanner uploads its results to GitHub code scanning. A final `gate` job fails the pull request when the change adds a high or critical finding, so you only need to make one check required. Findings that were already on the target branch don't block the pull request.
 
-I built this to show how I set up pipeline security: pinned and verified tools, least-privilege tokens, a gate that fails closed, and a written reason for every exception.
+I built this to show how I set up pipeline security: pinned and verified tools, least-privilege tokens, a gate that fails closed, and a written reason for every `nosemgrep` comment and ignore-file entry.
 
 ## See it work
 
@@ -33,6 +33,7 @@ name: security
 
 on:
   pull_request:
+  merge_group: # only needed if you use a merge queue
   push:
     branches: [main]
   schedule:
@@ -53,7 +54,9 @@ Replace `<commit-sha>` with the full SHA of the [latest release](https://github.
 
 Then make the `security / gate` check required, under Settings, Rules, Rulesets, "Require status checks to pass". The scanner jobs don't fail on findings, so the gate is the only check you need to require.
 
-On a private repository without GitHub Code Security, code scanning won't accept uploads. Add `with: { upload-sarif: false }`. The gate works the same, and each run keeps the reports as artifacts for 14 days.
+On a private repository without GitHub Code Security, code scanning won't accept uploads. Add `with: { upload-sarif: false }`. The gate works the same, pull requests still get annotations on the diff, and each run keeps the reports as artifacts for 14 days.
+
+The jobs run on GitHub-hosted `ubuntu-24.04` runners, and the runner can't be changed.
 
 ## Inputs
 
@@ -65,20 +68,21 @@ On a private repository without GitHub Code Security, code scanning won't accept
 | `semgrep-extra-rules-ref` | empty | Commit SHA of the extra rules repo. Required when the repo is set. A tag works but triggers a warning. |
 | `semgrep-extra-rules-path` | `.` | Folder of rules inside the extra rules repo. |
 | `sca-paths` | `.` | Space-separated paths that OSV-Scanner searches for lockfiles. |
-| `upload-sarif` | `true` | Upload results to code scanning. |
+| `upload-sarif` | `true` | Upload full-scan results to code scanning. |
+| `name` | empty | Suffix for artifact names and code scanning categories. Set a different one for each call when you call the workflow more than once in a run, for example once per service. |
 
-The workflow has one output, `blocking-findings`, with the number of findings that failed the gate.
+The workflow has one output, `blocking-findings`, with the number of findings that failed the gate. A job that reads it after a failed gate needs `if: always()`.
 
-To add a rule pack, such as [KhalidSharafEl-Din/semgrep-rules](https://github.com/KhalidSharafEl-Din/semgrep-rules), pass it next to the default rules:
+To add a team rule pack kept in its own repository, pass it next to the default rules:
 
 ```yaml
     with:
-      semgrep-extra-rules-repo: KhalidSharafEl-Din/semgrep-rules
+      semgrep-extra-rules-repo: your-org/semgrep-rules
       semgrep-extra-rules-ref: <commit-sha>
       semgrep-extra-rules-path: rules
 ```
 
-The workflow checks the pack out without credentials, so the rules repo must be public.
+The checkout uses the caller's `GITHUB_TOKEN`, which can't read other private repositories, so the rules repo must be public. For private rules, keep them in a folder of the scanned repo and add that path to `semgrep-config`.
 
 ## How the gate decides
 
@@ -86,8 +90,9 @@ The scope depends on the event:
 
 | Event | Scope |
 | --- | --- |
-| `pull_request`, `merge_group` | Only what the change adds. The checkout is GitHub's merge commit, and its first parent is the target branch, so that parent is the baseline. |
-| `push`, `schedule`, `workflow_dispatch` | Everything in the repository and, for Gitleaks, the full git history. |
+| `pull_request` | Only what the change adds. The checkout is GitHub's merge commit, and its first parent is the target branch, so that parent is the baseline. |
+| `merge_group` | Only what the queued group adds, against the base commit GitHub sends with the event. |
+| `push`, `schedule`, `workflow_dispatch` | Everything in the repository and, for Gitleaks, the full history of the checked-out commit. |
 
 Within that scope, a finding blocks when:
 
@@ -97,21 +102,23 @@ Within that scope, a finding blocks when:
 | OSV-Scanner | The advisory is new and its CVSS score is 7.0 or more (9.0 or more for `critical`). Malicious-package advisories (`MAL-` IDs) have no score and always block. Advisories with no score are reported as "unknown" and don't block. |
 | Gitleaks | Always. A leaked secret needs rotating whatever its type. |
 
-Every suppression without a written reason also counts as one blocking finding, and so does a scanner that crashed, timed out or was cancelled. The gate never reads a missing result as "no findings".
+Every suppression without a written reason also counts as one blocking finding, and so does a scanner that crashed, timed out or was cancelled. The gate never reads a missing result as "no findings". On pull requests, the suppression check only looks at the lines and ignore files the pull request changes.
 
 The baseline for "new" findings is different for each tool. Semgrep uses `--baseline-commit`. OSV-Scanner scans the baseline in a separate git worktree and compares advisories per lockfile and package. Gitleaks scans only the commits the pull request adds, which also catches a secret that was added and deleted again inside the same pull request.
+
+On pull requests, new findings show up as annotations on the diff and in the job summaries. Only full scans upload to code scanning. A pull request scan holds only the new findings, so uploading it would make code scanning mark every existing alert as fixed.
 
 ## Suppressing a false positive
 
 Each tool keeps its own suppression format, and the workflow checks that every entry explains itself.
 
-**Semgrep.** Put the comment on the line of the finding, with the rule ID and a reason after ` -- `:
+**Semgrep.** Put the comment on the line of the finding, with the rule ID and a reason after ` -- `. Separate several rule IDs with commas:
 
 ```js
 exec(cmd, cb); // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process -- cmd is a constant
 ```
 
-A bare `nosemgrep` or one with no reason fails the gate. To skip whole paths, such as generated code or test fixtures, add a `.semgrepignore` file.
+A bare `nosemgrep`, the short `nosem` form, or a comment with no reason fails the gate. To skip whole paths, such as generated code or test fixtures, add a `.semgrepignore` file. The workflow doesn't check `.semgrepignore` for reasons, so explain each path in a comment and review the file in code review.
 
 **OSV-Scanner.** Add an entry to `osv-scanner.toml` next to the lockfile. Both `reason` and `ignoreUntil` are required, so the decision comes back for review when it expires:
 
@@ -122,22 +129,22 @@ ignoreUntil = 2026-12-31
 reason = "Only called with constant templates and no options. Upgrade needs the template tests rewritten first."
 ```
 
-**Gitleaks.** Rotate the secret first. Then add its fingerprint (from the Gitleaks report) to `.gitleaksignore`, under a comment that says why:
+**Gitleaks.** Rotate the secret first. Then copy its fingerprint from the Gitleaks job summary into `.gitleaksignore`, under a comment that says why. One comment covers the block of lines below it, up to the next blank line:
 
 ```
 # Rotated on 2026-11-08, the key in this commit no longer works.
 3f2a9c1e7b4d8a6f0e5c2b1a9d8c7e6f5a4b3c2d:config/app.yml:generic-api-key:12
 ```
 
-For a known test value, a `# gitleaks:allow` comment on the line also works.
+Gitleaks also honors a `gitleaks:allow` comment on the line itself. The workflow can't check those for a reason, so prefer `.gitleaksignore`.
 
 ## Hardening choices
 
-- Every action is pinned to a full commit SHA with the version in a comment. In March 2026 an attacker force-pushed 76 of the 77 version tags of `aquasecurity/trivy-action` to malicious code ([CVE-2026-33634](https://www.aquasec.com/blog/trivy-supply-chain-attack-what-you-need-to-know)). Workflows pinned to a SHA kept running the code they had reviewed.
+- Every action is pinned to a full commit SHA with the version in a comment. In March 2026 an attacker force-pushed 76 of the 77 version tags of `aquasecurity/trivy-action` to malicious code ([CVE-2026-33634](https://github.com/advisories/GHSA-69fq-xp46-6x23), [Aqua's timeline](https://www.aquasec.com/blog/trivy-supply-chain-attack-what-you-need-to-know)). Workflows pinned to a SHA kept running the code they had reviewed.
 - The scanners are pinned too. The Semgrep container is pinned by digest, and the OSV-Scanner and Gitleaks downloads are checked against the SHA-256 checksums published with each release before they run.
 - Dependabot updates the pinned actions weekly, with a 7-day cooldown before it proposes a new release. Dependabot can't see the scanner pins, so `scripts/update-tool-pins.sh` refreshes them and verifies the checksums, and a weekly job in this repo warns when they're behind.
 - The workflow starts with `permissions: {}`, and each job asks only for what it uses. The gate job has no token permissions at all.
-- It runs on `pull_request`, never `pull_request_target`, so code from a fork never runs with a write token or secrets. Fork pull requests get a read-only token, so the workflow skips the code scanning upload for them. The gate doesn't depend on the upload, so it still decides.
+- It runs on `pull_request`, never `pull_request_target`, so code from a fork never runs with a write token or secrets. Fork pull requests get a read-only token. That's enough, because pull request scans never upload to code scanning, and the gate doesn't depend on the upload.
 - Checkouts use `persist-credentials: false`, so the token isn't left in `.git/config` for later steps to read.
 - Inputs and event data reach shell scripts through environment variables, never through `${{ }}` inside `run:`, which closes off script injection.
 - Gitleaks runs with `--redact`, so secret values stay out of logs, SARIF and artifacts.
@@ -158,7 +165,16 @@ Trivy's March 2026 compromise wasn't the reason. The fix for that risk is pinnin
 - It runs on `ubuntu-24.04` x64 runners. It uses Docker for Semgrep and Linux binaries for the other scanners.
 - It fetches the full git history (`fetch-depth: 0`) so it can compare against the baseline and scan every commit. Very large repositories will notice the checkout time.
 - `p/default` uses Semgrep's free community rules, which match within a single file. Cross-file taint tracking needs Semgrep's paid engine.
-- A full scan blocks on every finding in the repository. When you adopt it on a codebase with existing findings, the first `push` and `schedule` runs will fail until you fix or suppress them. Pull requests are unaffected, because they only see new findings.
+- A full scan blocks on every finding in the repository. See "Adopting it on an existing codebase" below.
+
+## Adopting it on an existing codebase
+
+Pull requests only see new findings, so they work from day one. Runs on `push` and `schedule` scan everything, and they stay red until the existing findings are fixed or suppressed. To get there:
+
+1. Run the workflow once with `workflow_dispatch` and read the three job summaries.
+2. For secrets, rotate each one. Then paste the fingerprints from the Gitleaks summary into `.gitleaksignore` as one block under a comment such as `# Historical findings, all rotated on 2026-11-08`.
+3. For dependencies, upgrade what's cheap. Add an `osv-scanner.toml` entry with a reason and an `ignoreUntil` date for the rest.
+4. For code, fix the blocking Semgrep findings or suppress them with a reason. Use `severity-threshold: critical` for a while if the list is long, and lower it once the backlog is gone.
 
 ## Repository layout
 
