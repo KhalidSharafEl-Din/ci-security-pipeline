@@ -1,0 +1,17 @@
+# Dependabot keeps the SHA-pinned actions current and updates the version
+# comment next to each SHA. The cooldown waits a week after a release before
+# proposing it, which gives the community time to catch a compromised release.
+# The demo app is left out on purpose: it exists to show a vulnerable lodash.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci

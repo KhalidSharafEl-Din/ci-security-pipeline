@@ -1,0 +1,13 @@
+{
+  "name": "ci-security-pipeline-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Small app used to show the security gate failing and passing.",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

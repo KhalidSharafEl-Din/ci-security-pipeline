@@ -1,0 +1,532 @@
+# Reusable security workflow: SAST (Semgrep), SCA (OSV-Scanner) and secret
+# scanning (Gitleaks), followed by one gate job that decides pass or fail.
+#
+# Call it from another repository with:
+#
+#   jobs:
+#     security:
+#       uses: KhalidSharafEl-Din/ci-security-pipeline/.github/workflows/security.yml@<commit-sha>
+#       permissions:
+#         contents: read
+#         security-events: write
+#         actions: read
+#
+# See README.md for inputs, the gate rules and how to suppress a finding.
+
+name: security
+
+on:
+  workflow_call:
+    inputs:
+      severity-threshold:
+        description: Lowest severity that fails the gate, "high" or "critical". Secrets always fail it.
+        type: string
+        default: high
+      semgrep-config:
+        description: Space-separated Semgrep configs (registry rulesets, URLs or paths in your repo).
+        type: string
+        default: p/default
+      semgrep-extra-rules-repo:
+        description: Optional "owner/repo" holding extra Semgrep rules, for example a team rule pack.
+        type: string
+        default: ""
+      semgrep-extra-rules-ref:
+        description: Commit SHA (recommended) or tag of the extra rules repo. Required when the repo is set.
+        type: string
+        default: ""
+      semgrep-extra-rules-path:
+        description: Path to the rules inside the extra rules repo.
+        type: string
+        default: .
+      sca-paths:
+        description: Space-separated paths that OSV-Scanner searches recursively for lockfiles.
+        type: string
+        default: .
+      upload-sarif:
+        description: Upload results to GitHub code scanning. Set to false on private repos without GitHub Code Security.
+        type: boolean
+        default: true
+    outputs:
+      blocking-findings:
+        description: Number of findings that failed the gate.
+        value: ${{ jobs.gate.outputs.blocking }}
+
+permissions: {}
+
+env:
+  # Tool versions live here so one change updates every job. Bump them with
+  # scripts/update-tool-pins.sh, which also refreshes the checksums and digest.
+  SEMGREP_IMAGE: semgrep/semgrep:1.184.0@sha256:cc1b68266f267878b39739373ea9985b9a78e5d64497dd875c8de100b22695ed
+  OSV_SCANNER_VERSION: 2.7.0
+  OSV_SCANNER_SHA256: 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+
+jobs:
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    outputs:
+      blocking: ${{ steps.result.outputs.blocking }}
+      total: ${{ steps.result.outputs.total }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out extra rules
+        if: inputs.semgrep-extra-rules-repo != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.semgrep-extra-rules-repo }}
+          ref: ${{ inputs.semgrep-extra-rules-ref }}
+          path: .semgrep-extra-rules
+          persist-credentials: false
+
+      - name: Work out scan scope
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          THRESHOLD: ${{ inputs.severity-threshold }}
+          EXTRA_REPO: ${{ inputs.semgrep-extra-rules-repo }}
+          EXTRA_REF: ${{ inputs.semgrep-extra-rules-ref }}
+        run: |
+          set -euo pipefail
+          case "$THRESHOLD" in
+            high) echo "min-rank=3" >> "$GITHUB_OUTPUT" ;;
+            critical) echo "min-rank=4" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::severity-threshold must be high or critical, got '$THRESHOLD'"; exit 1 ;;
+          esac
+          if [ -n "$EXTRA_REPO" ] && [ -z "$EXTRA_REF" ]; then
+            echo "::error::semgrep-extra-rules-ref is required when semgrep-extra-rules-repo is set"; exit 1
+          fi
+          if [ -n "$EXTRA_REF" ] && ! [[ "$EXTRA_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::warning::semgrep-extra-rules-ref is not a full commit SHA. Pin it to a SHA so the rules cannot change under you."
+          fi
+          # On pull requests the checkout is the merge commit, so its first
+          # parent is the target branch. Findings already there are not new.
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+            echo "mode=diff" >> "$GITHUB_OUTPUT"
+            echo "baseline=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Semgrep
+        id: scan
+        env:
+          MODE: ${{ steps.scope.outputs.mode }}
+          BASELINE: ${{ steps.scope.outputs.baseline }}
+          SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
+          EXTRA_REPO: ${{ inputs.semgrep-extra-rules-repo }}
+          EXTRA_PATH: ${{ inputs.semgrep-extra-rules-path }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/semgrep"
+          mkdir -p "$out"
+          args=(scan --metrics=off --disable-version-check
+                --exclude=.semgrep-extra-rules
+                --sarif-output=/out/semgrep.sarif --json-output=/out/semgrep.json)
+          read -r -a configs <<< "$SEMGREP_CONFIG"
+          for c in "${configs[@]}"; do args+=(--config "$c"); done
+          if [ -n "$EXTRA_REPO" ]; then args+=(--config ".semgrep-extra-rules/$EXTRA_PATH"); fi
+          if [ "$MODE" = "diff" ]; then args+=(--baseline-commit "$BASELINE"); fi
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" -v "$out:/out" -w /src \
+            --entrypoint sh "$SEMGREP_IMAGE" \
+            -c 'git config --global --add safe.directory /src && exec semgrep "$@"' semgrep "${args[@]}"
+
+      - name: Check suppressions have a reason
+        id: suppressions
+        run: |
+          set -euo pipefail
+          # Every nosemgrep comment must name the rule and give a reason:
+          #   // nosemgrep: rule-id -- why this is safe
+          # The bracket in the pattern stops this line from matching itself.
+          bad=$(git grep -nE 'nosem[g]rep' -- ':!*.md' | grep -vE 'nosem[g]rep: *[A-Za-z0-9_.-]+ +-- +[^ ]' || true)
+          count=0
+          if [ -n "$bad" ]; then
+            count=$(printf '%s\n' "$bad" | wc -l)
+            while IFS= read -r line; do
+              echo "::error file=${line%%:*}::nosemgrep without a rule ID and a reason (use 'nosemgrep: rule-id -- reason')"
+            done <<< "$bad"
+          fi
+          echo "violations=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate findings
+        id: result
+        env:
+          MIN_RANK: ${{ steps.scope.outputs.min-rank }}
+          MODE: ${{ steps.scope.outputs.mode }}
+          VIOLATIONS: ${{ steps.suppressions.outputs.violations }}
+        run: |
+          set -euo pipefail
+          json="$RUNNER_TEMP/semgrep/semgrep.json"
+          rank='def rank: {"CRITICAL":4,"HIGH":3,"ERROR":3,"MEDIUM":2,"WARNING":2,"LOW":1,"INFO":1}[.] // 0;'
+          total=$(jq '.results | length' "$json")
+          high=$(jq --argjson min "$MIN_RANK" "$rank"' [.results[] | select(.extra.severity | rank >= $min)] | length' "$json")
+          blocking=$((high + VIOLATIONS))
+          {
+            echo "### SAST (Semgrep)"
+            echo
+            if [ "$MODE" = "diff" ]; then echo "Scope: findings new in this pull request."; else echo "Scope: full scan."; fi
+            echo
+            echo "Findings: $total. Blocking: $blocking (suppressions without a reason: $VIOLATIONS)."
+            if [ "$total" -gt 0 ]; then
+              echo
+              echo "| Severity | Rule | Location | Gate |"
+              echo "| --- | --- | --- | --- |"
+              jq -r --argjson min "$MIN_RANK" "$rank"' .results[] |
+                "| \(.extra.severity) | `\(.check_id)` | `\(.path):\(.start.line)` | \(if (.extra.severity | rank) >= $min then "blocks" else "reported" end) |"' "$json"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "blocking=$blocking" >> "$GITHUB_OUTPUT"
+
+      - name: Upload SARIF to code scanning
+        # Fork pull requests get a read-only token, so the upload would fail.
+        # The gate does not depend on the upload, so skipping it is safe.
+        if: >-
+          always() && steps.scan.outcome == 'success' && inputs.upload-sarif &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: ${{ runner.temp }}/semgrep/semgrep.sarif
+          category: semgrep
+
+      - name: Keep the reports
+        if: always() && steps.scan.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: semgrep-report
+          path: ${{ runner.temp }}/semgrep/
+          retention-days: 14
+
+  sca:
+    name: SCA (OSV-Scanner)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    outputs:
+      blocking: ${{ steps.result.outputs.blocking }}
+      total: ${{ steps.result.outputs.total }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install OSV-Scanner
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP/bin"
+          curl -fsSL -o osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  osv-scanner" | sha256sum -c -
+          chmod +x osv-scanner
+
+      - name: Work out scan scope
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          THRESHOLD: ${{ inputs.severity-threshold }}
+        run: |
+          set -euo pipefail
+          case "$THRESHOLD" in
+            high) echo "min-score=7.0" >> "$GITHUB_OUTPUT" ;;
+            critical) echo "min-score=9.0" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::severity-threshold must be high or critical, got '$THRESHOLD'"; exit 1 ;;
+          esac
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+            echo "mode=diff" >> "$GITHUB_OUTPUT"
+            echo "baseline=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run OSV-Scanner
+        id: scan
+        env:
+          MODE: ${{ steps.scope.outputs.mode }}
+          BASELINE: ${{ steps.scope.outputs.baseline }}
+          SCA_PATHS: ${{ inputs.sca-paths }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/osv"
+          mkdir -p "$out"
+          read -r -a paths <<< "$SCA_PATHS"
+          # Exit codes: 0 no vulnerabilities, 1 vulnerabilities found,
+          # 128 no lockfiles found. Anything else is a real error.
+          osv() {
+            local format=$1 file=$2 rc=0
+            "$RUNNER_TEMP/bin/osv-scanner" scan source -r --format "$format" --output-file "$file" "${paths[@]}" || rc=$?
+            case "$rc" in
+              0|1) ;;
+              128) echo '{"results":[]}' > "$file" ;;
+              *) echo "::error::osv-scanner exited with $rc"; return "$rc" ;;
+            esac
+          }
+          osv json "$out/head.json"
+          osv sarif "$out/osv.sarif"
+          if [ ! -s "$out/osv.sarif" ] || ! jq -e .runs "$out/osv.sarif" > /dev/null 2>&1; then
+            echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"osv-scanner","rules":[]}},"results":[]}]}' > "$out/osv.sarif"
+          fi
+          if [ "$MODE" = "diff" ]; then
+            git worktree add --detach "$RUNNER_TEMP/baseline" "$BASELINE" > /dev/null
+            (cd "$RUNNER_TEMP/baseline" && osv json "$out/base.json")
+          else
+            echo '{"results":[]}' > "$out/base.json"
+          fi
+
+      - name: Check suppressions have a reason
+        id: suppressions
+        shell: python
+        run: |
+          import os, subprocess, tomllib
+          files = subprocess.run(["git", "ls-files", "*osv-scanner.toml"], capture_output=True, text=True, check=True).stdout.split()
+          violations = 0
+          for path in files:
+              with open(path, "rb") as fh:
+                  config = tomllib.load(fh)
+              for entry in config.get("IgnoredVulns", []):
+                  problems = []
+                  if not str(entry.get("reason", "")).strip():
+                      problems.append("a reason")
+                  if "ignoreUntil" not in entry:
+                      problems.append("an ignoreUntil date")
+                  if problems:
+                      violations += 1
+                      print(f"::error file={path}::Ignored vulnerability {entry.get('id', '?')} needs {' and '.join(problems)}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"violations={violations}\n")
+
+      - name: Evaluate findings
+        id: result
+        env:
+          MIN_SCORE: ${{ steps.scope.outputs.min-score }}
+          MODE: ${{ steps.scope.outputs.mode }}
+          VIOLATIONS: ${{ steps.suppressions.outputs.violations }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/osv"
+          # Flatten to one row per (lockfile, package, advisory). Paths are made
+          # relative so the head and baseline scans can be compared.
+          flatten='[.results[]? | .source.path as $src | .packages[]? | .package as $p | .groups[]? |
+            ($src | ltrimstr($root) | ltrimstr("/")) as $file |
+            {key: ($file + " " + $p.ecosystem + "/" + $p.name + " " + .ids[0]),
+             file: $file, pkg: "\($p.name)@\($p.version)", id: .ids[0],
+             cve: ([.aliases[]? | select(startswith("CVE-"))] | first // ""), score: (.max_severity // "")}]'
+          jq --arg root "$GITHUB_WORKSPACE" "$flatten" "$out/head.json" > "$out/head-rows.json"
+          jq --arg root "$RUNNER_TEMP/baseline" "$flatten" "$out/base.json" > "$out/base-rows.json"
+          # A row blocks when it is new, and its CVSS score meets the threshold
+          # or it is a known malicious package (MAL- advisories carry no score).
+          jq --slurpfile base "$out/base-rows.json" --argjson min "$MIN_SCORE" '
+            ($base[0] | map(.key)) as $old |
+            map(. + {new: ((.key | IN($old[])) | not)}) |
+            map(. + {blocks: (.new and ((.id | startswith("MAL-")) or ((.score | tonumber? // 0) >= $min)))})
+          ' "$out/head-rows.json" > "$out/rows.json"
+          total=$(jq 'length' "$out/rows.json")
+          vulns=$(jq '[.[] | select(.blocks)] | length' "$out/rows.json")
+          blocking=$((vulns + VIOLATIONS))
+          {
+            echo "### SCA (OSV-Scanner)"
+            echo
+            if [ "$MODE" = "diff" ]; then echo "Scope: advisories new in this pull request."; else echo "Scope: full scan."; fi
+            echo
+            echo "Advisories: $total. Blocking: $blocking (ignore entries without a reason or expiry: $VIOLATIONS)."
+            if [ "$total" -gt 0 ]; then
+              echo
+              echo "| Advisory | CVE | Package | CVSS | Lockfile | New | Gate |"
+              echo "| --- | --- | --- | --- | --- | --- | --- |"
+              jq -r '.[] | "| \(.id) | \(.cve) | `\(.pkg)` | \(if .score == "" then "unknown" else .score end) | `\(.file)` | \(if .new then "yes" else "no" end) | \(if .blocks then "blocks" else "reported" end) |"' "$out/rows.json"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "blocking=$blocking" >> "$GITHUB_OUTPUT"
+
+      - name: Upload SARIF to code scanning
+        if: >-
+          always() && steps.scan.outcome == 'success' && inputs.upload-sarif &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: ${{ runner.temp }}/osv/osv.sarif
+          category: osv-scanner
+
+      - name: Keep the reports
+        if: always() && steps.scan.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: osv-scanner-report
+          path: ${{ runner.temp }}/osv/
+          retention-days: 14
+
+  secrets:
+    name: Secrets (Gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    outputs:
+      blocking: ${{ steps.result.outputs.blocking }}
+      total: ${{ steps.result.outputs.total }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Gitleaks
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP/bin"
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$archive" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum -c -
+          tar -xzf "$archive" gitleaks
+
+      - name: Work out scan scope
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+            echo "mode=diff" >> "$GITHUB_OUTPUT"
+            echo "baseline=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Gitleaks
+        id: scan
+        env:
+          MODE: ${{ steps.scope.outputs.mode }}
+          BASELINE: ${{ steps.scope.outputs.baseline }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/gitleaks"
+          mkdir -p "$out"
+          # --redact keeps secret values out of the log and the SARIF file.
+          args=(git --redact --no-banner --exit-code 0
+                --report-format sarif --report-path "$out/gitleaks.sarif")
+          # On pull requests, scan every commit the PR adds, not only the
+          # final tree: a secret committed and then deleted is still leaked.
+          if [ "$MODE" = "diff" ]; then args+=("--log-opts=${BASELINE}..HEAD"); fi
+          "$RUNNER_TEMP/bin/gitleaks" "${args[@]}" .
+
+      - name: Check suppressions have a reason
+        id: suppressions
+        run: |
+          set -euo pipefail
+          # Each fingerprint in .gitleaksignore must sit under a "# reason" comment.
+          count=0
+          if [ -f .gitleaksignore ]; then
+            count=$(awk '
+              /^[[:space:]]*$/ { prev = ""; next }
+              /^[[:space:]]*#/ { prev = "comment"; next }
+              { if (prev != "comment") { bad++; printf "::error file=.gitleaksignore,line=%d::Fingerprint without a reason comment above it\n", NR > "/dev/stderr" } prev = "entry" }
+              END { print bad + 0 }' .gitleaksignore)
+          fi
+          echo "violations=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate findings
+        id: result
+        env:
+          MODE: ${{ steps.scope.outputs.mode }}
+          VIOLATIONS: ${{ steps.suppressions.outputs.violations }}
+        run: |
+          set -euo pipefail
+          sarif="$RUNNER_TEMP/gitleaks/gitleaks.sarif"
+          total=$(jq '[.runs[].results[]?] | length' "$sarif")
+          # Any secret blocks, whatever the severity threshold.
+          blocking=$((total + VIOLATIONS))
+          {
+            echo "### Secrets (Gitleaks)"
+            echo
+            if [ "$MODE" = "diff" ]; then echo "Scope: commits added by this pull request."; else echo "Scope: full git history."; fi
+            echo
+            echo "Secrets: $total. Blocking: $blocking (ignore entries without a reason: $VIOLATIONS)."
+            if [ "$total" -gt 0 ]; then
+              echo
+              echo "| Rule | Location | Commit |"
+              echo "| --- | --- | --- |"
+              jq -r '.runs[].results[] | "| `\(.ruleId)` | `\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)` | `\(.partialFingerprints.commitSha // "" | .[0:12])` |"' "$sarif"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "blocking=$blocking" >> "$GITHUB_OUTPUT"
+
+      - name: Upload SARIF to code scanning
+        if: >-
+          always() && steps.scan.outcome == 'success' && inputs.upload-sarif &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: ${{ runner.temp }}/gitleaks/gitleaks.sarif
+          category: gitleaks
+
+      - name: Keep the reports
+        if: always() && steps.scan.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gitleaks-report
+          path: ${{ runner.temp }}/gitleaks/
+          retention-days: 14
+
+  gate:
+    name: gate
+    needs: [sast, sca, secrets]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      blocking: ${{ steps.decide.outputs.blocking }}
+    steps:
+      - name: Decide
+        id: decide
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          # A scanner that crashed or was cancelled fails the gate. Silence
+          # from a broken scanner must never read as "no findings".
+          failed=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key) (\(.value.result))"' <<< "$NEEDS")
+          blocking=$(jq '[.[] | .outputs.blocking // "0" | tonumber] | add' <<< "$NEEDS")
+          echo "blocking=$blocking" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Security gate"
+            echo
+            echo "| Check | Job result | Findings | Blocking |"
+            echo "| --- | --- | --- | --- |"
+            jq -r 'to_entries[] | "| \(.key) | \(.value.result) | \(.value.outputs.total // "-") | \(.value.outputs.blocking // "-") |"' <<< "$NEEDS"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$failed" ]; then
+            echo "Result: FAIL. A scanner did not finish: $failed." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Gate failed because a scanner did not finish: $failed"
+            exit 1
+          fi
+          if [ "$blocking" -gt 0 ]; then
+            echo "Result: FAIL. $blocking blocking finding(s). See the scanner sections above." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Gate failed with $blocking blocking finding(s)"
+            exit 1
+          fi
+          echo "Result: PASS." >> "$GITHUB_STEP_SUMMARY"
