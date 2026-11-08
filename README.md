@@ -8,7 +8,7 @@ A reusable GitHub Actions workflow that runs three security scanners on every pu
 
 On pushes and scheduled runs, each scanner also uploads its results to GitHub code scanning. A final `gate` job fails the pull request when the change adds a high or critical finding, so you only need to make one check required. Findings that were already on the target branch don't block the pull request.
 
-I built this to show how I set up pipeline security: pinned and verified tools, least-privilege tokens, a gate that fails closed, and a required reason on every inline suppression, `.gitleaksignore` block and `osv-scanner.toml` entry.
+I built this to show how I set up pipeline security: pinned and verified tools, least-privilege tokens, a gate that fails closed, and a required reason on every `nosemgrep` comment, `.gitleaksignore` block and `osv-scanner.toml` entry.
 
 ## See it work
 
@@ -34,6 +34,7 @@ name: security
 on:
   pull_request:
   merge_group: # only needed if you use a merge queue
+  workflow_dispatch: # run a full scan by hand
   push:
     branches: [main]
   schedule:
@@ -54,7 +55,7 @@ The SHA above is the [v1.0.0 release](https://github.com/KhalidSharafEl-Din/ci-s
 
 Then make the `security / gate` check required, under Settings, Rules, Rulesets, "Require status checks to pass". The scanner jobs don't fail on findings, so the gate is the only check you need to require.
 
-On a private repository without GitHub Code Security, code scanning won't accept uploads. Add `with: { upload-sarif: false }`. The gate works the same, pull requests still get annotations on the diff, and each run keeps the reports as artifacts for 14 days.
+On a private repository without GitHub Code Security, code scanning won't accept uploads. Add `with: { upload-sarif: false }`, and keep the permissions block as it is: GitHub refuses to start the run if the caller grants less than the jobs declare. The gate works the same, pull requests still get annotations on the diff, and each run keeps the reports as artifacts for 14 days.
 
 The jobs run on GitHub-hosted `ubuntu-24.04` runners, and the runner can't be changed.
 
@@ -104,8 +105,9 @@ Within that scope, a finding blocks when:
 
 Some results that aren't findings also block, because each one means a clean result can't be trusted:
 
-- A `nosemgrep`, `gitleaks:allow`, `.gitleaksignore` block or `osv-scanner.toml` entry without a written reason. On pull requests, only the lines and ignore files the pull request changes are checked.
-- A Semgrep timeout or crash, which leaves part of the code unanalysed. Parse errors in single files are reported but don't block.
+- A `nosemgrep` comment, `.gitleaksignore` block or `osv-scanner.toml` entry without a written reason. On pull requests, only the lines and ignore files the pull request changes are checked.
+- A Semgrep timeout or crash, which leaves part of the code unanalysed. Parse errors in single files are reported but don't block. An incomplete scan also skips the code scanning upload, so existing alerts don't show as fixed.
+- A merge commit with three or more parents (an octopus merge). Gitleaks can't see what such a merge added, so the gate blocks it.
 - A pull request that removes every lockfile OSV-Scanner found on the target branch.
 - A scanner job that failed, timed out or was cancelled. The gate never reads a missing result as "no findings".
 
@@ -123,7 +125,7 @@ Each tool keeps its own suppression format. The workflow requires a reason on ea
 exec(cmd, cb); // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process -- cmd is a constant
 ```
 
-A bare `nosemgrep`, the short `nosem` form, or a comment with no reason fails the gate. To skip whole paths, such as generated code or test fixtures, add a `.semgrepignore` file and explain each path in a comment.
+Semgrep honors the marker in any letter case, wherever it follows a space, so the check does too. `nosemgrep`, `NOSEMGREP`, `// TODO nosem` or any form without a rule ID and a reason fails the gate. To skip whole paths, such as generated code or test fixtures, add a `.semgrepignore` file and explain each path in a comment.
 
 **OSV-Scanner.** Add an entry to `osv-scanner.toml` next to the lockfile. Both `reason` and `ignoreUntil` are required, so the decision comes back for review when it expires. A `[[PackageOverrides]]` entry, which can hide every advisory for a package, needs a `reason` and an `effectiveUntil` date:
 
@@ -134,14 +136,20 @@ ignoreUntil = 2026-12-31
 reason = "Only called with constant templates and no options. Upgrade needs the template tests rewritten first."
 ```
 
-**Gitleaks.** Rotate the secret first. Then copy its fingerprint from the Gitleaks job summary into `.gitleaksignore`, under a comment that says why. One comment covers the block of lines below it, up to the next blank line:
+**Gitleaks.** Copy the fingerprint from the Gitleaks job summary into `.gitleaksignore`, under a comment that says why. One comment covers the block of lines below it, up to the next blank line. The summary prints two forms:
+
+- For a real secret, rotate it first, then use the form with the commit SHA. It covers that one commit, so the same value committed again still fails.
+- For a false positive that stays in the code, use the form without the commit. It keeps working after a squash or rebase merge changes the commit SHA.
 
 ```
 # Rotated on 2026-11-08, the key in this commit no longer works.
 3f2a9c1e7b4d8a6f0e5c2b1a9d8c7e6f5a4b3c2d:config/app.yml:generic-api-key:12
+
+# Example value in the parser tests, not a credential.
+tests/fixtures/sample.yml:generic-api-key:3
 ```
 
-Gitleaks also honors an inline allow comment. The workflow requires a reason there too, in the form `# gitleaks:allow -- test fixture for the parser`.
+The workflow runs Gitleaks with `--ignore-gitleaks-allow`, so inline `gitleaks:allow` comments have no effect. Every exception goes through `.gitleaksignore`, where it needs a reason.
 
 **Scanner configuration.** `.gitleaks.toml`, `.semgrepignore` and `osv-scanner.toml` can switch rules off for whole paths, and the workflow can't judge whether that's justified. On pull requests it adds a warning to every changed scanner config file. Put those files under a `CODEOWNERS` entry that requires a security reviewer.
 
@@ -172,6 +180,7 @@ Trivy's March 2026 compromise wasn't the reason. The fix for that risk is pinnin
 - It runs on `ubuntu-24.04` x64 runners. It uses Docker for Semgrep and Linux binaries for the other scanners.
 - It fetches the full git history (`fetch-depth: 0`) so it can compare against the baseline and scan every commit. Very large repositories will notice the checkout time.
 - `p/default` uses Semgrep's free community rules, which match within a single file. Cross-file taint tracking needs Semgrep's paid engine.
+- Merge queue support hasn't run for real. Merge queues need an organization repository, and this one belongs to a personal account. The `merge_group` path uses the base commit GitHub documents for the event.
 - Generic secret rules have gaps. In [pull request #4](https://github.com/KhalidSharafEl-Din/ci-security-pipeline/pull/4), Gitleaks' generic API key rule skipped a random test key that contained the word "PUSH", and Semgrep's generic secret rule caught it. Running both is deliberate, and neither replaces GitHub's push protection.
 - A full scan blocks on every finding in the repository that meets the threshold. See "Adopting it on an existing codebase" below.
 
@@ -183,6 +192,7 @@ Pull requests only see new findings, so they work from day one. Runs on `push` a
 2. For secrets, rotate each one. Then paste the fingerprints from the Gitleaks summary into `.gitleaksignore` as one block under a comment such as `# Historical findings, all rotated on 2026-11-08`.
 3. For dependencies, upgrade what's cheap. Add an `osv-scanner.toml` entry with a reason and an `ignoreUntil` date for the rest.
 4. For code, fix the blocking Semgrep findings or suppress them with a reason. Use `severity-threshold: critical` for a while if the list is long, and lower it once the backlog is gone.
+5. If Semgrep times out on large generated or minified files, add them to `.semgrepignore` with a comment. A timeout blocks the gate, because those files were never analysed.
 
 ## Repository layout
 
